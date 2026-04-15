@@ -1,4 +1,4 @@
-// v4 – quotes: try single batch v7/finance/quote first, fall back to per-symbol chart
+// v5 – fix: symbols param must not be encodeURIComponent'd (commas must stay literal)
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -83,7 +83,6 @@ export default {
           const errJson = await geminiRes.json().catch(() => null);
           const errMsg  = errJson?.error?.message || 'Unknown Gemini error';
           const errCode = errJson?.error?.code || geminiRes.status;
-          // Surface quota errors with a readable message
           const friendly = errCode === 429
             ? 'Gemini quota exceeded — enable billing at aistudio.google.com or wait for quota reset'
             : `Gemini error ${errCode}: ${errMsg.slice(0, 200)}`;
@@ -94,7 +93,6 @@ export default {
         }
 
         const geminiData = await geminiRes.json();
-        // gemini-2.5-flash uses thinking mode: parts[0] is reasoning (thought:true), parts[1] is the actual response
         const parts   = geminiData.candidates?.[0]?.content?.parts || [];
         const rawJson = (parts.find(p => !p.thought) || parts[parts.length - 1])?.text;
 
@@ -107,7 +105,6 @@ export default {
 
         let payload;
         try {
-          // Strip markdown code fences if Gemini wrapped the JSON
           const cleaned = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
           payload = JSON.parse(cleaned);
         } catch (e) {
@@ -117,10 +114,8 @@ export default {
           });
         }
 
-        // Attach portfolio_id (not in Gemini's scope)
         payload.portfolio_id = portfolioId;
 
-        // 4. Save to valuations.php
         const saveRes = await fetch('https://labanos.dk/valuations.php', {
           method: 'POST',
           headers: {
@@ -229,7 +224,6 @@ export default {
     }
     const symbols = symbolsParam.split(',').map(s => s.trim()).filter(Boolean);
 
-    // Browser-like headers to reduce bot-detection blocks from Yahoo Finance
     const yfHeaders = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'application/json, text/plain, */*',
@@ -237,9 +231,10 @@ export default {
       'Referer': 'https://finance.yahoo.com/',
     };
 
-    // Strategy 1: single batch request to v7/finance/quote (1 round-trip for all symbols)
+    // Strategy 1: single batch request to v7/finance/quote
+    // NOTE: symbolsParam must NOT be encodeURIComponent'd — commas must stay literal
     try {
-      const batchUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbolsParam)}&fields=regularMarketPrice,regularMarketChangePercent`;
+      const batchUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${symbolsParam}&fields=regularMarketPrice,regularMarketChangePercent`;
       const batchRes = await fetch(batchUrl, { headers: yfHeaders });
       if (batchRes.ok) {
         const data = await batchRes.json();
@@ -252,7 +247,7 @@ export default {
       }
     } catch { /* fall through to per-symbol */ }
 
-    // Strategy 2: per-symbol chart fetch (original approach, kept as fallback)
+    // Strategy 2: per-symbol chart fetch (fallback)
     const results = await Promise.all(symbols.map(async symbol => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
@@ -289,9 +284,7 @@ export default {
 
 // ── Gemini prompt builder ─────────────────────────────────────────────────────
 function buildValuationPrompt(symbol, stmts, currentPrice, currency, today) {
-  // Convert raw dollar values to millions
   const toM = v => (v != null && v !== 0) ? Math.round(v / 1e6) : null;
-  // Shares: FMP returns actual count — convert to millions
   const toMShares = v => (v != null && v !== 0) ? Math.round(v / 1e6) : null;
 
   const rows = stmts.map(s => ({
@@ -311,7 +304,6 @@ function buildValuationPrompt(symbol, stmts, currentPrice, currency, today) {
   const latNM      = (y0.revenue && y0.net_income) ? ((y0.net_income / y0.revenue) * 100).toFixed(1) + '%' : 'N/A';
   const latOpConv  = (y0.op_income && y0.net_income) ? ((y0.net_income / y0.op_income) * 100).toFixed(1) + '%' : 'N/A';
 
-  // Build compact historical text
   const histText = rows.map(r =>
     `  FY${r.year}: Rev=${r.revenue}M  GP=${r.gross_profit}M  EBIT=${r.op_income}M  NI=${r.net_income}M  Shares=${r.shares}M`
   ).join('\n');
