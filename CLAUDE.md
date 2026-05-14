@@ -11,7 +11,7 @@
 - GitHub repo: https://github.com/labanos-projects/investtracker (default branch: `master`)
 - GitHub access token: stored in your `~/.claude/CLAUDE.md` on your local machine — never commit it here
 
-The app lets a logged-in user manage multiple investment portfolios, track holdings and transactions, view live price charts (Yahoo Finance), and run AI-generated DCF valuation models.
+The app lets a logged-in user manage multiple investment portfolios, track holdings and transactions, view live price charts (Yahoo Finance), maintain a watchlist of candidate symbols, and run AI-generated DCF valuation models.
 
 ## Architecture overview
 
@@ -31,7 +31,7 @@ Three independently deployed components:
     └─→ PHP API (labanos.dk)
           Shared hosting on one.com
           MySQL database (shared with `di` and `fitness_buddy`)
-          All CRUD endpoints for portfolios, holdings, transactions, notes, valuations
+          All CRUD endpoints for portfolios, holdings, transactions, notes, valuations, watchlists
           `sql.php` — admin SQL proxy for Claude (see "Database" below)
 ```
 
@@ -76,6 +76,8 @@ Three independently deployed components:
 │   ├── meta.php            # Sector/industry/country metadata (static map + FMP)
 │   ├── portfolio_history.php # Portfolio value snapshot history
 │   ├── valuations.php      # DCF valuation model CRUD
+│   ├── watchlists.php      # Watchlist CRUD (named lists, no transactions)
+│   ├── watchlist_items.php # Watchlist item CRUD (ticker, target_price, note)
 │   └── sql.php             # Admin SQL proxy for Claude (Bearer-auth, blocks DDL)
 │
 └── .github/
@@ -156,6 +158,33 @@ base_ccy VARCHAR(10)
 UNIQUE KEY (portfolio_id, snapshot_date, base_ccy)
 ```
 
+### `watchlists`
+```sql
+id INT AUTO_INCREMENT PK
+name VARCHAR(100)
+user_id INT                  -- FK to users.id
+base_currency VARCHAR(3)     -- display currency for the watchlist
+created_at TIMESTAMP
+```
+
+A watchlist is a **portfolio-like list of candidate symbols with no transactions**. Use it to follow potential buys before committing capital. Holdings/transactions/snapshots are NOT created for items on a watchlist.
+
+### `watchlist_items` (one row per ticker per watchlist)
+```sql
+id INT AUTO_INCREMENT PK
+watchlist_id INT
+ticker VARCHAR(20)           -- Internal ticker key
+yh_ticker VARCHAR(30)        -- Yahoo Finance symbol
+company VARCHAR(100)
+ccy VARCHAR(10)              -- Stock's native currency
+sector VARCHAR(80)           -- nullable
+country VARCHAR(80)          -- nullable
+target_price DECIMAL(18,6)   -- nullable; entry/buy price target
+note TEXT                    -- nullable; short thesis
+date_added TIMESTAMP
+UNIQUE KEY (watchlist_id, ticker)
+```
+
 ### `valuation_models`
 ```sql
 id INT AUTO_INCREMENT PK
@@ -226,6 +255,15 @@ All endpoints return JSON. Write operations require `Authorization: Bearer <user
 | `valuations.php` | GET | `?ticker=X` | Get latest DCF model |
 | `valuations.php` | POST | | Upsert full DCF model |
 | `valuations.php` | DELETE | `?id=N` | Delete model and child records |
+| `watchlists.php` | GET | | List all watchlists |
+| `watchlists.php` | POST | | Create watchlist `{name, base_currency?}` |
+| `watchlists.php` | PUT | `?id=N` | Rename or change base_currency |
+| `watchlists.php` | DELETE | `?id=N` | Delete (only if no items remain) |
+| `watchlist_items.php` | GET | `?watchlist_id=N` | List items on a watchlist |
+| `watchlist_items.php` | POST | | Add item `{watchlist_id, ticker, company, ccy, target_price?, note?, ...}` |
+| `watchlist_items.php` | POST | `?batch=1&watchlist_id=N` | Bulk seed items |
+| `watchlist_items.php` | PUT | `?id=N` | Update fields (target_price, note, ticker meta) |
+| `watchlist_items.php` | DELETE | `?id=N` | Remove item |
 | **`sql.php`** | **POST** | (Bearer `CLAUDE_SQL_TOKEN`) | **Claude's admin SQL proxy — see Database section** |
 
 ### Cloudflare Worker (https://yf-proxy.labanos.workers.dev/)
@@ -313,6 +351,9 @@ PHP on Apache shared hosting sometimes has issues with `DELETE`/`PUT`. Endpoints
 
 ### DB migrations are idempotent
 `db_migrate.php` runs on every PHP request and checks `INFORMATION_SCHEMA` before altering. Adding new migrations means appending to this file.
+
+### Watchlists vs portfolios
+A `watchlist` is a list of candidate symbols you're *thinking* about; a `portfolio` is what you actually own. Watchlists have no transactions, no snapshots, no holdings — just `{ticker, target_price, note}` rows. They share the user-scoped naming model (`watchlists.user_id`, `watchlists.base_currency`) so the frontend can render them the same way as portfolios.
 
 ### Valuation models are portfolio-agnostic
 `valuation_models` is unique on `(ticker, model_date)` — not per portfolio. `portfolio_id` is stored for audit only.
