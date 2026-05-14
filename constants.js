@@ -1,15 +1,17 @@
 const { useState, useEffect, useCallback } = React;
 
 // ─── APIs ──────────────────────────────────────────────────────────────────
-const NOTES_API        = 'https://labanos.dk/notes.php';
-const TRANSACTIONS_API = 'https://labanos.dk/transactions.php';
-const PORTFOLIO_API    = 'https://labanos.dk/portfolio.php';
-const META_API         = 'https://labanos.dk/meta.php';
-const AUTH_API         = 'https://labanos.dk/auth.php';
-const PORTFOLIOS_API   = 'https://labanos.dk/portfolios.php';
-const HISTORY_API      = 'https://labanos.dk/portfolio_history.php';
-const VALUATIONS_API   = 'https://labanos.dk/valuations.php';
-const WORKER_URL       = 'https://yf-proxy.labanos.workers.dev/';
+const NOTES_API           = 'https://labanos.dk/notes.php';
+const TRANSACTIONS_API    = 'https://labanos.dk/transactions.php';
+const PORTFOLIO_API       = 'https://labanos.dk/portfolio.php';
+const META_API            = 'https://labanos.dk/meta.php';
+const AUTH_API            = 'https://labanos.dk/auth.php';
+const PORTFOLIOS_API      = 'https://labanos.dk/portfolios.php';
+const HISTORY_API         = 'https://labanos.dk/portfolio_history.php';
+const VALUATIONS_API      = 'https://labanos.dk/valuations.php';
+const WATCHLISTS_API      = 'https://labanos.dk/watchlists.php';
+const WATCHLIST_ITEMS_API = 'https://labanos.dk/watchlist_items.php';
+const WORKER_URL          = 'https://yf-proxy.labanos.workers.dev/';
 
 // Returns fetch headers including auth token if logged in
 const authHeaders = () => {

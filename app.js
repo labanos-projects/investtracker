@@ -24,6 +24,11 @@ function App() {
   const [baseCcy,       setBaseCcy]       = useState('DKK');
   const [pfListLoaded,  setPfListLoaded]  = useState(false);
 
+  // ── View / Watchlist state ──
+  const [view,         setView]         = useState(() => localStorage.getItem('tracker_view') || 'portfolio');
+  const [watchlists,   setWatchlists]   = useState([]);
+  const [watchlistId,  setWatchlistId]  = useState(null);
+
   // ── Auth state ──
   const [user,         setUser]         = useState(null);   // null = not logged in
   const [authChecked,  setAuthChecked]  = useState(false);  // prevents flash
@@ -55,6 +60,9 @@ function App() {
 
   // Keep ref in sync whenever portfolio state changes
   useEffect(() => { if (portfolio.length > 0) portfolioRef.current = portfolio; }, [portfolio]);
+
+  // Persist active view across reloads
+  useEffect(() => { localStorage.setItem('tracker_view', view); }, [view]);
 
   // ── Fetch + cache sector/country metadata for holdings that lack it ──
   useEffect(() => {
@@ -130,6 +138,26 @@ function App() {
         setPfListLoaded(true);
       })
       .catch(() => setPfListLoaded(true));
+  }, []);
+
+  // ── Load watchlists on mount (public read) ──
+  useEffect(() => {
+    fetch(WATCHLISTS_API)
+      .then(r => r.ok ? r.json() : [])
+      .then(wls => {
+        if (wls.length > 0) {
+          setWatchlists(wls);
+          const saved = parseInt(localStorage.getItem('selected_watchlist_id'));
+          const found = wls.find(w => w.id === saved);
+          setWatchlistId((found || wls[0]).id);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const switchWatchlist = useCallback((id) => {
+    setWatchlistId(id);
+    localStorage.setItem('selected_watchlist_id', id);
   }, []);
 
   // ── Auth: check setup + restore session on mount ──
@@ -447,27 +475,41 @@ function App() {
     return v.toLocaleString('da-DK', {minimumFractionDigits:2, maximumFractionDigits:2});
   };
 
+  const handleAddClick = () => {
+    if (view === 'watchlist') {
+      requireLogin(() => setShowAddModal(true));
+    } else {
+      setShowAddModal(true);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 pb-10">
 
       {/* ── Header ── */}
       <div className="bg-gray-900 text-white px-4 py-3 flex items-center justify-between sticky top-0 z-20">
         <div className="flex items-center gap-2">
-          {pfListLoaded && portfolios.length > 0 ? (
-            <PortfolioSwitcher
-              portfolios={portfolios}
-              portfolioId={portfolioId}
-              onSwitch={switchPortfolio}
-              onCreateNew={handlePortfolioAction}
-              onCcyChange={handleCcyChange}
-              user={user}
-            />
+          {view === 'portfolio' ? (
+            pfListLoaded && portfolios.length > 0 ? (
+              <PortfolioSwitcher
+                portfolios={portfolios}
+                portfolioId={portfolioId}
+                onSwitch={switchPortfolio}
+                onCreateNew={handlePortfolioAction}
+                onCcyChange={handleCcyChange}
+                user={user}
+              />
+            ) : (
+              <span className="font-semibold text-[15px]">Portfolio</span>
+            )
           ) : (
-            <span className="font-semibold text-[15px]">Portfolio</span>
+            <span className="font-semibold text-[15px]">Watchlist</span>
           )}
-          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${isLive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
-            {isLive ? '● live' : '○ cached'}
-          </span>
+          {view === 'portfolio' && (
+            <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${isLive ? 'bg-emerald-500/20 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
+              {isLive ? '● live' : '○ cached'}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {user ? (
@@ -486,24 +528,41 @@ function App() {
           ) : null}
           {user && (
           <button
-            onClick={() => setShowAddModal(true)}
-            title="Add new holding"
+            onClick={handleAddClick}
+            title={view === 'watchlist' ? 'Add symbol to watchlist' : 'Add new holding'}
             className="text-xs bg-blue-600 hover:bg-blue-500 active:bg-blue-700 transition-colors px-3 py-1.5 rounded-full font-semibold"
           >
             + New
           </button>
           )}
-          <button
-            onClick={() => fetchPrices()}
-            className="text-xs bg-gray-700 hover:bg-gray-600 active:bg-gray-500 transition-colors px-3 py-1.5 rounded-full"
-          >
-            {refreshing ? <span className="inline-block spin">↻</span> : '↻'}
-          </button>
+          {view === 'portfolio' && (
+            <button
+              onClick={() => fetchPrices()}
+              className="text-xs bg-gray-700 hover:bg-gray-600 active:bg-gray-500 transition-colors px-3 py-1.5 rounded-full"
+            >
+              {refreshing ? <span className="inline-block spin">↻</span> : '↻'}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* ── Add Holding Modal ── */}
-      {showAddModal && (
+      {/* ── View tab strip ── */}
+      <div className="bg-white border-b border-gray-100 px-4 py-1.5 flex items-center gap-1">
+        {[
+          ['portfolio', 'Holdings'],
+          ['watchlist', 'Watchlist'],
+        ].map(([v, label]) => (
+          <button key={v} onClick={() => setView(v)}
+            className={`text-[11px] font-semibold px-2.5 py-1 rounded-full transition-colors ${
+              view === v ? 'bg-gray-900 text-white' : 'text-gray-500 hover:bg-gray-100'
+            }`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ── Add Holding Modal (portfolio view only) ── */}
+      {showAddModal && view === 'portfolio' && (
         <AddHoldingModal
           onClose={() => setShowAddModal(false)}
           onAdded={handlePortfolioChanged}
@@ -522,182 +581,212 @@ function App() {
         <SetupModal onComplete={handleSetupComplete} />
       )}
 
-      {/* ── Price timestamp bar ── */}
-      {lastUpdated && (
-        <div className={`px-4 py-1.5 flex items-center justify-between text-[11px] border-b ${isLive ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
-          <span>
-            {isLive ? '● Prices as of' : '⚠ Cached prices from'}{' '}
-            <span className="font-semibold mono">
-              {lastUpdated.toLocaleTimeString('da-DK', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}
-            </span>
-            {' '}
-            <span className="opacity-70">
-              {lastUpdated.toLocaleDateString('da-DK', {day:'2-digit', month:'2-digit', year:'numeric'})}
-            </span>
-          </span>
-          {!isLive && <span className="font-medium">Live data unavailable</span>}
-        </div>
+      {/* ── Watchlist view ── */}
+      {view === 'watchlist' && (
+        watchlists.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 gap-3 text-gray-400 px-4 text-center">
+            <span className="text-3xl">👁</span>
+            <span className="text-sm">No watchlist yet.</span>
+            {user && (
+              <p className="text-[12px] max-w-xs">
+                Once you have a watchlist set up on the server, this is where it'll show up. (The migration creates one automatically.)
+              </p>
+            )}
+          </div>
+        ) : (
+          <WatchlistView
+            user={user}
+            onRequireLogin={requireLogin}
+            watchlists={watchlists}
+            watchlistId={watchlistId}
+            onSwitchWatchlist={switchWatchlist}
+            showAddModal={showAddModal}
+            setShowAddModal={setShowAddModal}
+          />
+        )
       )}
 
-      {loading ? (
-        <div className="flex flex-col items-center justify-center h-64 gap-2 text-gray-400">
-          <span className="text-2xl spin">↻</span>
-          <span className="text-sm">Fetching prices…</span>
-        </div>
-      ) : (
+      {/* ── Portfolio view ── */}
+      {view === 'portfolio' && (
         <>
-          {/* ── Summary row ── */}
-          <div className="grid bg-white border-b border-gray-100" style={{ gridTemplateColumns: '1fr 1fr 1fr auto' }}>
-            <div className="px-4 py-3 border-r border-gray-100">
-              <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Portfolio</div>
-              <div className="font-bold text-gray-900 mono text-base leading-tight">
-                {n(totalValue, 0)}<span className="text-xs font-normal text-gray-400"> {baseCcy}</span>
+          {/* Price timestamp bar */}
+          {lastUpdated && (
+            <div className={`px-4 py-1.5 flex items-center justify-between text-[11px] border-b ${isLive ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
+              <span>
+                {isLive ? '● Prices as of' : '⚠ Cached prices from'}{' '}
+                <span className="font-semibold mono">
+                  {lastUpdated.toLocaleTimeString('da-DK', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}
+                </span>
+                {' '}
+                <span className="opacity-70">
+                  {lastUpdated.toLocaleDateString('da-DK', {day:'2-digit', month:'2-digit', year:'numeric'})}
+                </span>
+              </span>
+              {!isLive && <span className="font-medium">Live data unavailable</span>}
+            </div>
+          )}
+
+          {loading ? (
+            <div className="flex flex-col items-center justify-center h-64 gap-2 text-gray-400">
+              <span className="text-2xl spin">↻</span>
+              <span className="text-sm">Fetching prices…</span>
+            </div>
+          ) : (
+            <>
+              {/* ── Summary row ── */}
+              <div className="grid bg-white border-b border-gray-100" style={{ gridTemplateColumns: '1fr 1fr 1fr auto' }}>
+                <div className="px-4 py-3 border-r border-gray-100">
+                  <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Portfolio</div>
+                  <div className="font-bold text-gray-900 mono text-base leading-tight">
+                    {n(totalValue, 0)}<span className="text-xs font-normal text-gray-400"> {baseCcy}</span>
+                  </div>
+                </div>
+                <div className="px-4 py-3 border-r border-gray-100">
+                  <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Today</div>
+                  <div className={`font-bold mono text-base leading-tight ${clr(todayTotal)}`}>{pct(todayPct)}</div>
+                  <div className={`text-[11px] mono ${clr(todayTotal)}`}>{signed(todayTotal,0)} {baseCcy}</div>
+                </div>
+                <div className="px-4 py-3 border-r border-gray-100">
+                  <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Total G/L</div>
+                  <div className={`font-bold mono text-base leading-tight ${clr(totalGL)}`}>{pct(totalGLPct)}</div>
+                  <div className={`text-[11px] mono ${clr(totalGL)}`}>{signed(totalGL,0)} {baseCcy}</div>
+                </div>
+                {/* icon buttons stacked */}
+                <div className="flex flex-col border-l border-gray-100 divide-y divide-gray-100">
+                  <button
+                    onClick={() => { setShowHistory(v => !v); setShowInsights(false); }}
+                    title="Portfolio value history"
+                    className={`flex-1 px-4 flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                      showHistory ? 'bg-gray-900 text-white' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
+                    }`}
+                  >
+                    {/* line chart icon */}
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+                    </svg>
+                    <span className="text-[9px] uppercase tracking-wide font-medium">History</span>
+                  </button>
+                  <button
+                    onClick={() => { setShowInsights(v => !v); setShowHistory(false); }}
+                    title="Portfolio insights"
+                    className={`flex-1 px-4 flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                      showInsights ? 'bg-gray-900 text-white' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
+                    }`}
+                  >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/>
+                    </svg>
+                    <span className="text-[9px] uppercase tracking-wide font-medium">Insights</span>
+                  </button>
+                </div>
               </div>
-            </div>
-            <div className="px-4 py-3 border-r border-gray-100">
-              <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Today</div>
-              <div className={`font-bold mono text-base leading-tight ${clr(todayTotal)}`}>{pct(todayPct)}</div>
-              <div className={`text-[11px] mono ${clr(todayTotal)}`}>{signed(todayTotal,0)} {baseCcy}</div>
-            </div>
-            <div className="px-4 py-3 border-r border-gray-100">
-              <div className="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Total G/L</div>
-              <div className={`font-bold mono text-base leading-tight ${clr(totalGL)}`}>{pct(totalGLPct)}</div>
-              <div className={`text-[11px] mono ${clr(totalGL)}`}>{signed(totalGL,0)} {baseCcy}</div>
-            </div>
-            {/* icon buttons stacked */}
-            <div className="flex flex-col border-l border-gray-100 divide-y divide-gray-100">
-              <button
-                onClick={() => { setShowHistory(v => !v); setShowInsights(false); }}
-                title="Portfolio value history"
-                className={`flex-1 px-4 flex flex-col items-center justify-center gap-0.5 transition-colors ${
-                  showHistory ? 'bg-gray-900 text-white' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
-                }`}
-              >
-                {/* line chart icon */}
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-                </svg>
-                <span className="text-[9px] uppercase tracking-wide font-medium">History</span>
-              </button>
-              <button
-                onClick={() => { setShowInsights(v => !v); setShowHistory(false); }}
-                title="Portfolio insights"
-                className={`flex-1 px-4 flex flex-col items-center justify-center gap-0.5 transition-colors ${
-                  showInsights ? 'bg-gray-900 text-white' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
-                }`}
-              >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/>
-                </svg>
-                <span className="text-[9px] uppercase tracking-wide font-medium">Insights</span>
-              </button>
-            </div>
-          </div>
 
-          {/* ── History panel ── */}
-          {showHistory && (
-            <div className="px-4 pt-3 pb-1 bg-gray-50 border-b border-gray-100">
-              <PortfolioChart positions={withWeight} allTxns={allTxns} baseCcy={baseCcy} />
-            </div>
+              {/* ── History panel ── */}
+              {showHistory && (
+                <div className="px-4 pt-3 pb-1 bg-gray-50 border-b border-gray-100">
+                  <PortfolioChart positions={withWeight} allTxns={allTxns} baseCcy={baseCcy} />
+                </div>
+              )}
+
+              {/* ── Insights panel ── */}
+              {showInsights && (
+                <InsightsPanel
+                  positions={withWeight}
+                  baseCcy={baseCcy}
+                  metaLoading={metaLoading}
+                />
+              )}
+
+              {/* ── Table ── */}
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse">
+                  <thead>
+                    <tr className="bg-gray-100 border-b border-gray-200">
+                      <th className="px-4 py-2 text-left text-xs text-gray-400 font-normal">Stock</th>
+                      <SortBtn col="value" label="Value" />
+                      <SortBtn col="today" label="Today" />
+                      <SortBtn col="gl"    label="G/L" />
+                      <th className="px-3 py-2 text-right text-xs text-gray-400 font-normal">Wt</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {/* Active positions */}
+                    {sortedActive.map((p, i) => (
+                      <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)} className={`border-b border-gray-100 cursor-pointer transition-colors ${i%2===0 ? 'bg-white hover:bg-blue-50' : 'bg-gray-50/60 hover:bg-blue-50'}`}>
+                        <td className="px-4 py-2.5 min-w-[110px]">
+                          <div className="font-semibold text-gray-900 text-[13px]">{p.ticker}</div>
+                          <div className="text-[11px] text-gray-400 truncate max-w-[110px]">{p.company}</div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right">
+                          <div className="font-medium text-gray-800 mono text-[13px]">{n(p.valueBase,0)}</div>
+                          <div className="text-[11px] text-gray-400 mono">{priceStr(p)} <span className="text-[10px]">{p.ccy}</span></div>
+                        </td>
+                        <td className={`px-3 py-2.5 text-right mono ${clr(p.chgPct)}`}>
+                          <div className="text-[13px] font-semibold">{pct(p.chgPct)}</div>
+                          <div className="text-[11px] opacity-80">{signed(p.todayBase,0)}</div>
+                        </td>
+                        <td className={`px-3 py-2.5 text-right mono ${clr(p.glPct)}`}>
+                          <div className="text-[13px] font-semibold">{pct(p.glPct)}</div>
+                          <div className="text-[11px] opacity-80">{signed(p.glBase,0)}</div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right text-[11px] text-gray-400 mono">
+                          {n(p.weight*100,1)}%
+                        </td>
+                      </tr>
+                    ))}
+
+                    {/* Closed positions toggle row */}
+                    {closedPositions.length > 0 && (
+                      <tr className="border-t border-gray-200 bg-gray-50/50">
+                        <td colSpan={5}>
+                          <button
+                            onClick={() => setShowClosed(s => !s)}
+                            className="w-full px-4 py-2.5 text-left text-[12px] text-gray-400 hover:text-gray-600 flex items-center gap-1.5"
+                          >
+                            <span className="text-[10px]">{showClosed ? '▾' : '▸'}</span>
+                            {showClosed ? 'Hide' : 'Show'} {closedPositions.length} closed position{closedPositions.length !== 1 ? 's' : ''}
+                          </button>
+                        </td>
+                      </tr>
+                    )}
+
+                    {/* Closed positions rows */}
+                    {showClosed && sortedClosed.map((p) => (
+                      <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)}
+                        className="border-b border-gray-50 cursor-pointer bg-gray-50/30 hover:bg-blue-50 opacity-50">
+                        <td className="px-4 py-2.5 min-w-[110px]">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-semibold text-gray-500 text-[13px]">{p.ticker}</span>
+                            <span className="text-[9px] text-gray-400 bg-gray-100 px-1 py-0.5 rounded uppercase tracking-wide">closed</span>
+                          </div>
+                          <div className="text-[11px] text-gray-400 truncate max-w-[110px]">{p.company}</div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right">
+                          <div className="text-[11px] text-gray-400 italic">—</div>
+                          <div className="text-[11px] text-gray-300 mono">{priceStr(p)} <span className="text-[10px]">{p.ccy}</span></div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right mono text-gray-300">
+                          <div className="text-[13px]">{pct(p.chgPct)}</div>
+                        </td>
+                        <td className="px-3 py-2.5 text-right mono text-gray-300 text-[13px]">—</td>
+                        <td className="px-3 py-2.5 text-right text-[11px] text-gray-300 mono">—</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* ── Footer: FX rates ── */}
+              <div className="px-4 py-3 text-[11px] text-gray-400 text-center border-t border-gray-100 bg-white mt-0">
+                FX → {baseCcy}: &nbsp;
+                {baseCcy !== 'USD' && <>USD {(fx.USD/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
+                {baseCcy !== 'EUR' && <>EUR {(fx.EUR/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
+                {baseCcy !== 'DKK' && <>DKK {(1/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
+                {baseCcy !== 'CAD' && <>CAD {(fx.CAD/(fx[baseCcy]||1)).toFixed(4)}</>}
+                {!isLive && <span className="ml-2 text-amber-500">cached</span>}
+              </div>
+            </>
           )}
-
-          {/* ── Insights panel ── */}
-          {showInsights && (
-            <InsightsPanel
-              positions={withWeight}
-              baseCcy={baseCcy}
-              metaLoading={metaLoading}
-            />
-          )}
-
-          {/* ── Table ── */}
-          <div className="overflow-x-auto">
-            <table className="w-full border-collapse">
-              <thead>
-                <tr className="bg-gray-100 border-b border-gray-200">
-                  <th className="px-4 py-2 text-left text-xs text-gray-400 font-normal">Stock</th>
-                  <SortBtn col="value" label="Value" />
-                  <SortBtn col="today" label="Today" />
-                  <SortBtn col="gl"    label="G/L" />
-                  <th className="px-3 py-2 text-right text-xs text-gray-400 font-normal">Wt</th>
-                </tr>
-              </thead>
-              <tbody>
-                {/* Active positions */}
-                {sortedActive.map((p, i) => (
-                  <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)} className={`border-b border-gray-100 cursor-pointer transition-colors ${i%2===0 ? 'bg-white hover:bg-blue-50' : 'bg-gray-50/60 hover:bg-blue-50'}`}>
-                    <td className="px-4 py-2.5 min-w-[110px]">
-                      <div className="font-semibold text-gray-900 text-[13px]">{p.ticker}</div>
-                      <div className="text-[11px] text-gray-400 truncate max-w-[110px]">{p.company}</div>
-                    </td>
-                    <td className="px-3 py-2.5 text-right">
-                      <div className="font-medium text-gray-800 mono text-[13px]">{n(p.valueBase,0)}</div>
-                      <div className="text-[11px] text-gray-400 mono">{priceStr(p)} <span className="text-[10px]">{p.ccy}</span></div>
-                    </td>
-                    <td className={`px-3 py-2.5 text-right mono ${clr(p.chgPct)}`}>
-                      <div className="text-[13px] font-semibold">{pct(p.chgPct)}</div>
-                      <div className="text-[11px] opacity-80">{signed(p.todayBase,0)}</div>
-                    </td>
-                    <td className={`px-3 py-2.5 text-right mono ${clr(p.glPct)}`}>
-                      <div className="text-[13px] font-semibold">{pct(p.glPct)}</div>
-                      <div className="text-[11px] opacity-80">{signed(p.glBase,0)}</div>
-                    </td>
-                    <td className="px-3 py-2.5 text-right text-[11px] text-gray-400 mono">
-                      {n(p.weight*100,1)}%
-                    </td>
-                  </tr>
-                ))}
-
-                {/* Closed positions toggle row */}
-                {closedPositions.length > 0 && (
-                  <tr className="border-t border-gray-200 bg-gray-50/50">
-                    <td colSpan={5}>
-                      <button
-                        onClick={() => setShowClosed(s => !s)}
-                        className="w-full px-4 py-2.5 text-left text-[12px] text-gray-400 hover:text-gray-600 flex items-center gap-1.5"
-                      >
-                        <span className="text-[10px]">{showClosed ? '▾' : '▸'}</span>
-                        {showClosed ? 'Hide' : 'Show'} {closedPositions.length} closed position{closedPositions.length !== 1 ? 's' : ''}
-                      </button>
-                    </td>
-                  </tr>
-                )}
-
-                {/* Closed positions rows */}
-                {showClosed && sortedClosed.map((p) => (
-                  <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)}
-                    className="border-b border-gray-50 cursor-pointer bg-gray-50/30 hover:bg-blue-50 opacity-50">
-                    <td className="px-4 py-2.5 min-w-[110px]">
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-semibold text-gray-500 text-[13px]">{p.ticker}</span>
-                        <span className="text-[9px] text-gray-400 bg-gray-100 px-1 py-0.5 rounded uppercase tracking-wide">closed</span>
-                      </div>
-                      <div className="text-[11px] text-gray-400 truncate max-w-[110px]">{p.company}</div>
-                    </td>
-                    <td className="px-3 py-2.5 text-right">
-                      <div className="text-[11px] text-gray-400 italic">—</div>
-                      <div className="text-[11px] text-gray-300 mono">{priceStr(p)} <span className="text-[10px]">{p.ccy}</span></div>
-                    </td>
-                    <td className="px-3 py-2.5 text-right mono text-gray-300">
-                      <div className="text-[13px]">{pct(p.chgPct)}</div>
-                    </td>
-                    <td className="px-3 py-2.5 text-right mono text-gray-300 text-[13px]">—</td>
-                    <td className="px-3 py-2.5 text-right text-[11px] text-gray-300 mono">—</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {/* ── Footer: FX rates ── */}
-          <div className="px-4 py-3 text-[11px] text-gray-400 text-center border-t border-gray-100 bg-white mt-0">
-            FX → {baseCcy}: &nbsp;
-            {baseCcy !== 'USD' && <>USD {(fx.USD/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
-            {baseCcy !== 'EUR' && <>EUR {(fx.EUR/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
-            {baseCcy !== 'DKK' && <>DKK {(1/(fx[baseCcy]||1)).toFixed(4)}&nbsp;·&nbsp;</>}
-            {baseCcy !== 'CAD' && <>CAD {(fx.CAD/(fx[baseCcy]||1)).toFixed(4)}</>}
-            {!isLive && <span className="ml-2 text-amber-500">cached</span>}
-          </div>
         </>
       )}
     </div>
