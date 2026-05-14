@@ -75,4 +75,78 @@ function run_migrations($pdo) {
         UNIQUE KEY uniq_pf_date_ccy (portfolio_id, snapshot_date, base_ccy),
         INDEX idx_pf_ccy (portfolio_id, base_ccy)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // 7. watchlists — named lists of candidate symbols, no transactions
+    $pdo->exec("CREATE TABLE IF NOT EXISTS watchlists (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        name          VARCHAR(100) NOT NULL,
+        user_id       INT NOT NULL,
+        base_currency VARCHAR(3) NOT NULL DEFAULT 'DKK',
+        created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_user (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // 8. watchlist_items — one row per ticker per watchlist
+    $pdo->exec("CREATE TABLE IF NOT EXISTS watchlist_items (
+        id            INT AUTO_INCREMENT PRIMARY KEY,
+        watchlist_id  INT NOT NULL,
+        ticker        VARCHAR(20)  NOT NULL,
+        yh_ticker     VARCHAR(30)  NOT NULL,
+        company       VARCHAR(100) NOT NULL,
+        ccy           VARCHAR(10)  NOT NULL DEFAULT 'USD',
+        sector        VARCHAR(80)  NULL,
+        country       VARCHAR(80)  NULL,
+        target_price  DECIMAL(18,6) NULL,
+        note          TEXT NULL,
+        date_added    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_wl_ticker (watchlist_id, ticker),
+        INDEX idx_wl (watchlist_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // 9. ONE-OFF migration — promote any legacy `portfolios` row named 'Watchlist'
+    //    into the new `watchlists` table. Strict guards keep this safe:
+    //      (a) the legacy portfolio has 0 transactions (no real holdings)
+    //      (b) the user does not already have a watchlist
+    //      (c) idempotent — once migrated, the legacy `portfolios` row is removed
+    if ($tableExists('portfolios') && $tableExists('portfolio')) {
+        $hasBaseCcy = $hasCol('portfolios', 'base_currency');
+        $sql = $hasBaseCcy
+            ? "SELECT id, name, user_id, base_currency FROM portfolios WHERE name = 'Watchlist'"
+            : "SELECT id, name, user_id, 'DKK' AS base_currency FROM portfolios WHERE name = 'Watchlist'";
+        $legacy = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($legacy as $row) {
+            // guard (b)
+            $chk = $pdo->prepare("SELECT id FROM watchlists WHERE user_id = ? LIMIT 1");
+            $chk->execute([$row['user_id']]);
+            if ($chk->fetch()) continue;
+
+            // guard (a)
+            $tx = $pdo->prepare("SELECT COUNT(*) FROM transactions WHERE portfolio_id = ?");
+            $tx->execute([$row['id']]);
+            if ((int)$tx->fetchColumn() > 0) continue;
+
+            // create the watchlist
+            $ins = $pdo->prepare(
+                "INSERT INTO watchlists (name, user_id, base_currency) VALUES (?, ?, ?)"
+            );
+            $ins->execute([$row['name'], $row['user_id'], $row['base_currency'] ?: 'DKK']);
+            $newWlId = (int)$pdo->lastInsertId();
+
+            // copy holdings → watchlist_items
+            $copy = $pdo->prepare(
+                "INSERT INTO watchlist_items
+                    (watchlist_id, ticker, yh_ticker, company, ccy, sector, country, date_added)
+                 SELECT ?, ticker, yh_ticker, company, ccy, sector, country, created_at
+                 FROM portfolio WHERE portfolio_id = ?"
+            );
+            $copy->execute([$newWlId, $row['id']]);
+
+            // clean up legacy rows
+            $pdo->prepare("DELETE FROM portfolio          WHERE portfolio_id = ?")->execute([$row['id']]);
+            $pdo->prepare("DELETE FROM investment_notes   WHERE portfolio_id = ?")->execute([$row['id']]);
+            $pdo->prepare("DELETE FROM portfolio_snapshots WHERE portfolio_id = ?")->execute([$row['id']]);
+            $pdo->prepare("DELETE FROM portfolios          WHERE id = ?")->execute([$row['id']]);
+        }
+    }
 }
