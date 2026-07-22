@@ -1,4 +1,8 @@
-// v6 – fix FX symbols: encode = in names, add per-fetch AbortController timeout
+// v7 – fix stale intraday change%: don't trust Yahoo's regularMarketChangePercent
+// (its regularMarketPreviousClose can lag several sessions behind for some
+// non-US tickers, e.g. JYSK.CO). Always derive prevClose from chart history
+// instead, same logic the old "Strategy 2" fallback used — now applied
+// unconditionally rather than only when the batch quote request fails.
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -180,7 +184,38 @@ export default {
         .finally(() => clearTimeout(timer));
     };
 
-    // Strategy 1: single batch request to v7/finance/quote
+    // Robust previous-close lookup: scan recent daily closes and pick the last
+    // one that isn't "today" (Europe/Copenhagen). Yahoo's own
+    // regularMarketPreviousClose / regularMarketChangePercent fields are not
+    // reliable for this — for some tickers they lag multiple sessions behind,
+    // which shows up as "yesterday's change" (or older) still being displayed
+    // well after today's session has opened.
+    const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
+    const getRobustPrevClose = async (symbol) => {
+      try {
+        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
+        const res   = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
+        const data  = await res.json();
+        const result     = data?.chart?.result?.[0];
+        const meta       = result?.meta;
+        if (!meta) return null;
+        const timestamps = result?.timestamp ?? [];
+        const closes     = result?.indicators?.quote?.[0]?.close ?? [];
+        const today      = fmtDate.format(new Date());
+        for (let i = timestamps.length - 1; i >= 0; i--) {
+          if (closes[i] != null && fmtDate.format(new Date(timestamps[i] * 1000)) !== today) {
+            return closes[i];
+          }
+        }
+        return meta.chartPreviousClose ?? meta.previousClose ?? null;
+      } catch {
+        return null;
+      }
+    };
+
+    // Strategy 1: single batch request to v7/finance/quote for live prices,
+    // then override each symbol's change% with a chart-derived prevClose
+    // rather than trusting Yahoo's own regularMarketChangePercent.
     // FX symbols like USDDKK=X contain = which must be encoded as %3D in the URL
     // but commas must stay literal so Yahoo Finance sees them as separators
     try {
@@ -191,14 +226,24 @@ export default {
         const data = await batchRes.json();
         const batchResults = data?.quoteResponse?.result || [];
         if (batchResults.length > 0) {
-          return new Response(JSON.stringify({ quoteResponse: { result: batchResults, error: null } }), {
+          const corrected = await Promise.all(batchResults.map(async q => {
+            const price = q.regularMarketPrice;
+            const prevClose = await getRobustPrevClose(q.symbol);
+            const changePercent = (prevClose && price != null)
+              ? ((price - prevClose) / prevClose) * 100
+              // Fall back to Yahoo's own figure only if we couldn't derive one ourselves
+              : (q.regularMarketChangePercent ?? 0);
+            return { symbol: q.symbol, regularMarketPrice: price, regularMarketChangePercent: changePercent };
+          }));
+          return new Response(JSON.stringify({ quoteResponse: { result: corrected, error: null } }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
           });
         }
       }
     } catch { /* fall through to per-symbol */ }
 
-    // Strategy 2: per-symbol chart fetch with individual timeouts (fallback)
+    // Strategy 2: per-symbol chart fetch with individual timeouts (fallback,
+    // used when the batch quote request itself fails outright)
     const results = await Promise.all(symbols.map(async symbol => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
@@ -210,7 +255,6 @@ export default {
         const price        = meta.regularMarketPrice ?? null;
         const timestamps   = result?.timestamp ?? [];
         const closes       = result?.indicators?.quote?.[0]?.close ?? [];
-        const fmtDate      = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
         const today        = fmtDate.format(new Date());
         let prevClose = null;
         for (let i = timestamps.length - 1; i >= 0; i--) {
