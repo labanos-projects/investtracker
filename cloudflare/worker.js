@@ -193,7 +193,12 @@ export default {
     const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
     const getRobustPrevClose = async (symbol) => {
       try {
-        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
+        // Use 5-minute bars, not daily (1d) bars: Yahoo's daily-aggregated
+        // candle for some tickers (e.g. JYSK.CO) isn't published until well
+        // after that session closes, which made this lookup land on a stale
+        // (multi-day-old) close. Intraday bars are current, so bucket those
+        // by calendar day instead.
+        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
         const res   = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
         const data  = await res.json();
         const result     = data?.chart?.result?.[0];
@@ -246,7 +251,8 @@ export default {
     // used when the batch quote request itself fails outright)
     const results = await Promise.all(symbols.map(async symbol => {
       try {
-        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
+        // 5-minute bars (see note in getRobustPrevClose above) rather than 1d
+        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
         const res  = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
         const data = await res.json();
         const result     = data?.chart?.result?.[0];
