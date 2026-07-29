@@ -19,10 +19,8 @@
 //     still work. Statement data now comes from EDGAR or from Yahoo's
 //     fundamentals-timeseries endpoint, never from quoteSummary.
 //
-//  2. Series are keyed by FISCAL YEAR and aligned on it. v1 zipped
-//     net_income[i] / shares[i] by index, so two arrays of equal length
-//     covering different years produced a silently wrong EPS CAGR — that's
-//     what made NVDA's EPS CAGR read 6.2% and its PEG 4.75.
+//  2. Series are keyed by period END year and aligned on it. See edgarFacts
+//     for the two XBRL traps this cost us.
 //
 //  3. CIK resolution falls back to company-name matching. "NOVO-B.CO" reduces
 //     to "NOVO" but Novo Nordisk's ADR is "NVO", so the ticker-root lookup
@@ -40,15 +38,15 @@ const j = async (url, opts = {}, ms = 8000) => {
 };
 
 // ─── Year-keyed series helpers ───────────────────────────────────────────────
-// A "series" is a Map<fiscalYear, value>. Aligning on the key rather than the
-// index is the whole point — see fix (2) above.
+// A "series" is a Map<periodEndYear, value>. Aligning on the key rather than
+// the index is the whole point.
 
 const lastN = (map, n = 5) => {
   if (!map || !map.size) return [];
   return [...map.keys()].sort((a, b) => a - b).slice(-n).map(y => map.get(y));
 };
 
-/** Element-wise A/B over the fiscal years present in BOTH series. */
+/** Element-wise A/B over the years present in BOTH series. */
 const ratioSeries = (a, b) => {
   if (!a || !b) return null;
   const years = [...a.keys()].filter(y => b.has(y) && b.get(y) !== 0).sort((x, y) => x - y);
@@ -56,7 +54,7 @@ const ratioSeries = (a, b) => {
   return years.slice(-5).map(y => a.get(y) / b.get(y));
 };
 
-/** Element-wise A-B over shared fiscal years (for CFO − capex). */
+/** Element-wise A-B over shared years (for CFO − capex). */
 const diffSeries = (a, b) => {
   if (!a) return null;
   const years = [...a.keys()].sort((x, y) => x - y);
@@ -84,8 +82,8 @@ export async function fxToUsd(ccy) {
 }
 
 // ─── Yahoo cookie + crumb handshake ──────────────────────────────────────────
-// Confirmed working from the Worker across all 9 tickers in the first live run,
-// which contradicts the CLAUDE.md gotcha. Keep an eye on it — it's undocumented.
+// Confirmed working from the Worker across all 9 tickers, which contradicts the
+// CLAUDE.md gotcha. Keep an eye on it — it's undocumented.
 let _crumb = null, _cookie = null, _crumbAt = 0;
 
 export async function yahooCrumb() {
@@ -192,8 +190,7 @@ async function loadSecMaps() {
  * Resolve a CIK. Exact ticker first, then ticker root, then company name.
  *
  * The name fallback is what makes European 20-F filers reachable: "NOVO-B.CO"
- * roots to "NOVO", but Novo Nordisk lists in the US as "NVO". Matching on
- * "NOVONORDISK" finds CIK 353278 and unlocks the IFRS branch.
+ * roots to "NOVO", but Novo Nordisk lists in the US as "NVO".
  */
 export async function secCik(symbol, companyName) {
   await loadSecMaps();
@@ -204,6 +201,14 @@ export async function secCik(symbol, companyName) {
   if (companyName) {
     const n = normName(companyName);
     if (n && _nameMap[n]) return _nameMap[n];
+    // SEC writes "NOVO NORDISK A S" (space-separated), which normalises to
+    // NOVONORDISKAS, while Yahoo's "Novo Nordisk A/S" gives NOVONORDISK.
+    // Allow a short prefix overhang so the two meet.
+    if (n && n.length >= 8) {
+      for (const k of Object.keys(_nameMap)) {
+        if (k.startsWith(n) && k.length - n.length <= 3) return _nameMap[k];
+      }
+    }
   }
   return null;
 }
@@ -228,8 +233,6 @@ const TAGS = {
     ['us-gaap', 'WeightedAverageNumberOfSharesOutstandingBasic'],
     ['ifrs-full', 'WeightedAverageNumberOfDilutedSharesOutstanding'],
   ],
-  // Cash flow — absent in v1, which is why FCF was null for every ticker even
-  // where EDGAR answered fine.
   cfo: [
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivities'],
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
@@ -247,29 +250,58 @@ export async function edgarFacts(cik) {
   const d = await j(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,
     { headers: { 'User-Agent': UA } }, 15000);
 
-  const pull = (aliases) => {
+  /**
+   * @param {boolean} singleFiling  Restrict to the most recent accession.
+   *
+   * Two traps in the XBRL frames data, both found the hard way:
+   *
+   *  (a) `fy` is the fiscal year of the REPORT, not of the data point. One
+   *      NVDA 10-K carries three annual periods (ending 2023-01-29,
+   *      2024-01-28, 2025-01-26) all tagged fy=2025. Keying on `fy` kept
+   *      whichever happened to be iterated last. Key on the period END.
+   *
+   *  (b) Per-share quantities are restated across stock splits, and only
+   *      WITHIN a filing. NVDA's pre-2024 filings report pre-split counts;
+   *      the FY2025 10-K restates its own comparatives post-split. Merging
+   *      filings therefore reads a 10:1 split as 10x dilution — share CAGR
+   *      came out +76.3% instead of -0.9%. For share counts we take one
+   *      filing's comparatives: 3 consistent years beat 5 inconsistent ones.
+   */
+  const pull = (aliases, singleFiling = false) => {
     for (const [taxonomy, tag] of aliases) {
       const units = d.facts?.[taxonomy]?.[tag]?.units;
       if (!units) continue;
       const unitKey = Object.keys(units).find(u => /^[A-Z]{3}$/.test(u)) || Object.keys(units)[0];
-      const rows = (units[unitKey] || [])
-        .filter(r => ['10-K', '20-F', '40-F'].includes(r.form) && r.fp === 'FY' && r.fy);
+      let rows = (units[unitKey] || []).filter(r => {
+        if (!['10-K', '20-F', '40-F'].includes(r.form) || !r.end) return false;
+        if (!r.start) return true;                       // instant concept
+        const days = (new Date(r.end) - new Date(r.start)) / 864e5;
+        return days > 300 && days < 400;                 // annual duration only
+      });
       if (!rows.length) continue;
-      // Keyed by fiscal year, latest-filed restatement wins.
-      const map = new Map();
-      for (const r of rows.sort((a, b) => (a.filed || '').localeCompare(b.filed || ''))) {
-        map.set(r.fy, r.val);
+
+      rows.sort((a, b) => (a.filed || '').localeCompare(b.filed || '') || a.end.localeCompare(b.end));
+
+      if (singleFiling) {
+        const latestAccn = rows[rows.length - 1].accn;
+        const scoped = rows.filter(r => r.accn === latestAccn);
+        if (scoped.length >= 2) rows = scoped;
       }
+
+      const map = new Map();
+      for (const r of rows) map.set(parseInt(r.end.slice(0, 4)), r.val);
       return { unit: unitKey, map };
     }
     return null;
   };
 
+  const SPLIT_SENSITIVE = new Set(['shares']);
+
   const out = { currency: null, entityName: d.entityName };
   for (const [field, aliases] of Object.entries(TAGS)) {
-    const got = pull(aliases);
+    const got = pull(aliases, SPLIT_SENSITIVE.has(field));
     if (got) {
-      out[field] = got.map;                     // Map<fiscalYear, value>
+      out[field] = got.map;                     // Map<periodEndYear, value>
       if (/^[A-Z]{3}$/.test(got.unit) && !out.currency) out.currency = got.unit;
     }
   }
@@ -299,11 +331,14 @@ export async function resolveMetrics(symbol, env) {
   // ── EDGAR first for anything audited ──
   if (edgar) {
     set('rev_cagr', cagrOf(lastN(edgar.revenue)), 'edgar');
+    // net_income ∩ shares — shares is single-filing, so this narrows to that
+    // filing's comparative years, which is exactly what we want: both sides of
+    // the ratio come from one consistently-restated basis.
     set('eps_cagr', cagrOf(ratioSeries(edgar.net_income, edgar.shares)), 'edgar');
     set('share_change', cagrOf(lastN(edgar.shares)), 'edgar');
     const gm = ratioSeries(edgar.gross_profit, edgar.revenue);
     if (gm) set('gross_margin', gm[gm.length - 1], 'edgar');
-    // FCF = CFO − capex, aligned on fiscal year. capex is filed positive here.
+    // FCF = CFO − capex, aligned on period end. capex is filed positive here.
     const fcf = diffSeries(edgar.cfo, edgar.capex);
     if (fcf && fcf.length >= 2) m.fcf_series = { value: fcf, source: 'edgar' };
     // ROIC proxy: NI / (equity + debt). Debt is Yahoo's, hence the blend.
@@ -379,6 +414,7 @@ export async function resolveMetrics(symbol, env) {
     ts_ok: !!ts,
     ts_fields: ts ? Object.keys(ts) : [],
     fcf_source: m.fcf_series?.source || null,
+    eps_source: m.eps_cagr?.source || null,
   };
   return m;
 }
