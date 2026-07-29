@@ -1,6 +1,6 @@
 // v7 – fix stale intraday change%: don't trust Yahoo's regularMarketChangePercent
 // v8 – add ?score_ticker= endpoint: YF quoteSummary + Gemini qual scoring
-// v9 – fix YF 401: fetch crumb+cookie before quoteSummary
+// v9 – fix YF 401: use v7/quote (no auth) instead of v10/quoteSummary
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -171,192 +171,118 @@ export default {
       }
       const symbol = scoreTickerSym.toUpperCase().trim();
       try {
-        // 1. Get Yahoo Finance crumb + cookie (required since ~2024)
-        const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-        let crumb = '', cookieStr = '';
-        try {
-          const homeRes = await fetch('https://finance.yahoo.com/', {
-            headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' },
-            redirect: 'follow',
-          });
-          // Cloudflare Workers supports headers.getAll('set-cookie')
-          const setCookies = typeof homeRes.headers.getAll === 'function'
-            ? homeRes.headers.getAll('set-cookie')
-            : (homeRes.headers.get('set-cookie') || '').split(/,(?=[^ ])/);
-          cookieStr = setCookies.map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
-
-          const crumbRes = await fetch('https://query1.finance.yahoo.com/v1/test/getcrumb', {
-            headers: { 'User-Agent': UA, 'Cookie': cookieStr },
-          });
-          if (crumbRes.ok) crumb = (await crumbRes.text()).trim();
-        } catch (_) { /* proceed without crumb — might still work */ }
-
-        // 2. Fetch Yahoo Finance quoteSummary
-        const modules = [
-          'incomeStatementHistory', 'balanceSheetHistory',
-          'cashflowStatementHistory', 'defaultKeyStatistics',
-          'financialData', 'assetProfile', 'quoteType', 'price',
+        // 1. Fetch via v7/quote — no auth required, works from CF Workers
+        const YF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+        const fields = [
+          'regularMarketPrice','marketCap','longName','shortName',
+          'sector','industry','quoteType',
+          'returnOnEquity','revenueGrowth','grossMargins','operatingMargins',
+          'profitMargins','debtToEquity','freeCashflow','earningsGrowth',
+          'pegRatio','dividendYield','payoutRatio','trailingPegRatio',
+          'heldPercentInsiders','epsTrailingTwelveMonths','epsForward',
+          'ebitda','totalDebt','totalCash','returnOnAssets','bookValue',
+          'sharesOutstanding','floatShares','currency',
         ].join(',');
-        const crumbParam = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
-        const yfSummaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${encodeURIComponent(modules)}${crumbParam}`;
-        const yfRes = await fetch(yfSummaryUrl, {
-          headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Cookie': cookieStr },
+        const quoteUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbol)}&fields=${encodeURIComponent(fields)}`;
+        const quoteRes = await fetch(quoteUrl, {
+          headers: { 'User-Agent': YF_UA, 'Accept': 'application/json', 'Referer': 'https://finance.yahoo.com/' },
         });
-        if (!yfRes.ok) throw new Error(`Yahoo Finance ${yfRes.status} for ${symbol}`);
-        const yfData  = await yfRes.json();
-        const summary = yfData?.quoteSummary?.result?.[0];
-        if (!summary) throw new Error(`Ticker ${symbol} not found — check symbol`);
+        if (!quoteRes.ok) throw new Error(`Yahoo Finance ${quoteRes.status} for ${symbol}`);
+        const quoteData = await quoteRes.json();
+        const q = quoteData?.quoteResponse?.result?.[0];
+        if (!q) throw new Error(`Ticker ${symbol} not found — check symbol`);
 
-        // 3. Extract modules
-        const fd  = summary.financialData || {};
-        const ks  = summary.defaultKeyStatistics || {};
-        const ap  = summary.assetProfile || {};
-        const qt  = summary.quoteType || {};
-        const pr  = summary.price || {};
-        const inc = summary.incomeStatementHistory?.incomeStatementHistory   || [];
-        const bs  = summary.balanceSheetHistory?.balanceSheetHistory         || [];
-        const cf  = summary.cashflowStatementHistory?.cashflowStatementHistory || [];
-        const rv  = (obj) => (obj && obj.raw !== undefined) ? obj.raw : null;
-
-        const sector    = ap.sector   || '';
-        const industry  = ap.industry || '';
-        const company   = pr.longName || qt.longName || qt.shortName || symbol;
-        const marketCap = rv(pr.marketCap) ?? rv(ks.marketCap);
+        // 2. Extract fields
+        const sector    = q.sector   || '';
+        const industry  = q.industry || '';
+        const company   = q.longName || q.shortName || symbol;
+        const marketCap = q.marketCap ?? null;
 
         const SECTOR_GM = {
           'Technology': 55, 'Communication Services': 55, 'Healthcare': 55,
           'Financial Services': 50, 'Consumer Cyclical': 35, 'Consumer Defensive': 35,
           'Industrials': 30, 'Basic Materials': 28, 'Energy': 25, 'Real Estate': 45, 'Utilities': 40,
         };
-        const sectorBM  = SECTOR_GM[sector] ?? 40;
-        const safeAvg   = (arr) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
-        const cagr      = (start, end, yrs) => (start > 0 && end > 0 && yrs > 0) ? Math.pow(end / start, 1 / yrs) - 1 : null;
+        const sectorBM = SECTOR_GM[sector] ?? 40;
 
-        // Extract time series (index 0 = most recent)
-        const revenues   = inc.map(s => rv(s.totalRevenue)).filter(v => v !== null);
-        const grossProfs = inc.map(s => rv(s.grossProfit)).filter(v => v !== null);
-        const netIncomes = inc.map(s => rv(s.netIncome)).filter(v => v !== null);
-        const epsVals    = inc.map(s => rv(s.dilutedEps) ?? rv(s.basicEps)).filter(v => v !== null);
-        const opIncomes  = inc.map(s => rv(s.operatingIncome) ?? rv(s.ebit)).filter(v => v !== null);
-        const equities   = bs.map(s => rv(s.totalStockholderEquity)).filter(v => v !== null);
-        const assets     = bs.map(s => rv(s.totalAssets)).filter(v => v !== null);
-        const currLiabs  = bs.map(s => rv(s.totalCurrentLiabilities)).filter(v => v !== null);
-        const bsCash     = bs.map(s => rv(s.cash) ?? 0);
-        const bsDebt     = bs.map(s => (rv(s.shortLongTermDebt) || 0) + (rv(s.longTermDebt) || 0));
-        const bsShares   = bs.map(s => rv(s.commonStock)).filter(v => v !== null);
-        const opCFs      = cf.map(s => rv(s.totalCashFromOperatingActivities)).filter(v => v !== null);
-        const capExs     = cf.map(s => Math.abs(rv(s.capitalExpenditures) || 0));
-
-        // 4. Score quant criteria
+        // 3. Score quant criteria from v7/quote fields
         const criteria = {};
 
         // ROE
-        const roes = equities.map((eq, i) => eq > 0 && netIncomes[i] !== undefined ? (netIncomes[i] / eq) * 100 : null).filter(v => v !== null);
-        if (roes.length > 0) {
-          const avg = safeAvg(roes);
-          criteria.roe = { score: avg >= 20 ? 2 : avg >= 15 ? 1 : 0, note: `Avg ROE ${avg.toFixed(1)}% over ${roes.length} yr${roes.length > 1 ? 's' : ''}`, weight: 3, tier: 1 };
-        } else {
-          const fdROE = rv(fd.returnOnEquity); const p = fdROE !== null ? fdROE * 100 : null;
-          criteria.roe = { score: p !== null ? (p >= 20 ? 2 : p >= 15 ? 1 : 0) : 0, note: p !== null ? `ROE ${p.toFixed(1)}%` : 'No data', weight: 3, tier: 1 };
-        }
+        const roe = q.returnOnEquity != null ? q.returnOnEquity * 100 : null;
+        criteria.roe = { score: roe != null ? (roe >= 20 ? 2 : roe >= 15 ? 1 : 0) : 0, note: roe != null ? `ROE ${roe.toFixed(1)}%` : 'No data', weight: 3, tier: 1 };
 
         // Revenue growth
-        if (revenues.length >= 2) {
-          const rate = cagr(revenues[revenues.length - 1], revenues[0], revenues.length - 1);
-          const p = rate !== null ? rate * 100 : null;
-          criteria.rev_growth = { score: p !== null ? (p >= 10 ? 2 : p >= 5 ? 1 : 0) : 0, note: p !== null ? `Revenue CAGR ${p.toFixed(1)}% over ${revenues.length - 1} yr${revenues.length > 2 ? 's' : ''}` : 'Could not compute', weight: 3, tier: 1 };
-        } else {
-          const g = rv(fd.revenueGrowth); const p = g !== null ? g * 100 : null;
-          criteria.rev_growth = { score: p !== null ? (p >= 10 ? 2 : p >= 5 ? 1 : 0) : 0, note: p !== null ? `Revenue growth ${p.toFixed(1)}% YoY` : 'Insufficient data', weight: 3, tier: 1 };
-        }
+        const revG = q.revenueGrowth != null ? q.revenueGrowth * 100 : null;
+        criteria.rev_growth = { score: revG != null ? (revG >= 10 ? 2 : revG >= 5 ? 1 : 0) : 0, note: revG != null ? `Revenue growth ${revG.toFixed(1)}% YoY` : 'No data', weight: 3, tier: 1 };
 
         // Gross margin vs sector
-        const margins = revenues.map((rev, i) => rev > 0 && grossProfs[i] !== undefined ? (grossProfs[i] / rev) * 100 : null).filter(v => v !== null);
-        if (margins.length > 0) {
-          const avg = safeAvg(margins), diff = avg - sectorBM;
-          criteria.gross_margin = { score: diff >= 5 ? 2 : diff >= -5 ? 1 : 0, note: `Avg GM ${avg.toFixed(1)}% vs sector ~${sectorBM}% (${diff >= 0 ? '+' : ''}${diff.toFixed(1)}pp)`, weight: 3, tier: 1 };
+        const gm = q.grossMargins != null ? q.grossMargins * 100 : null;
+        if (gm != null) {
+          const diff = gm - sectorBM;
+          criteria.gross_margin = { score: diff >= 5 ? 2 : diff >= -5 ? 1 : 0, note: `GM ${gm.toFixed(1)}% vs sector ~${sectorBM}% (${diff >= 0 ? '+' : ''}${diff.toFixed(1)}pp)`, weight: 3, tier: 1 };
         } else {
-          const gm = rv(fd.grossMargins);
-          if (gm !== null) { const p = gm * 100, diff = p - sectorBM; criteria.gross_margin = { score: diff >= 5 ? 2 : diff >= -5 ? 1 : 0, note: `GM ${p.toFixed(1)}% vs sector ~${sectorBM}%`, weight: 3, tier: 1 }; }
-          else criteria.gross_margin = { score: 0, note: 'No data', weight: 3, tier: 1 };
+          criteria.gross_margin = { score: 0, note: 'No gross margin data', weight: 3, tier: 1 };
         }
 
         // Insider ownership
-        const ins = rv(ks.heldPercentInsiders);
-        criteria.insider_own = ins !== null
+        const ins = q.heldPercentInsiders;
+        criteria.insider_own = ins != null
           ? { score: ins >= 0.10 ? 2 : ins >= 0.05 ? 1 : 0, note: `Insider ownership ${(ins * 100).toFixed(1)}%`, weight: 3, tier: 1 }
           : { score: 1, note: 'Insider data unavailable', weight: 3, tier: 1 };
 
         // EPS growth
-        if (epsVals.length >= 2) {
-          const oldest = epsVals[epsVals.length - 1], newest = epsVals[0];
-          const rate = oldest > 0 ? cagr(Math.abs(oldest), Math.abs(newest), epsVals.length - 1) : null;
-          const p = rate !== null ? rate * 100 : null;
-          criteria.eps_growth = { score: oldest < 0 ? 1 : p !== null ? (p >= 10 ? 2 : p >= 5 ? 1 : 0) : 0, note: p !== null ? `EPS CAGR ${p.toFixed(1)}% over ${epsVals.length - 1} yr${epsVals.length > 2 ? 's' : ''}` : 'EPS was negative', weight: 2, tier: 2 };
-        } else {
-          const g = rv(fd.earningsGrowth); const p = g !== null ? g * 100 : null;
-          criteria.eps_growth = { score: p !== null ? (p >= 10 ? 2 : p >= 5 ? 1 : 0) : 0, note: p !== null ? `EPS growth ${p.toFixed(1)}% YoY` : 'No EPS data', weight: 2, tier: 2 };
-        }
+        const epsG = q.earningsGrowth != null ? q.earningsGrowth * 100 : null;
+        criteria.eps_growth = { score: epsG != null ? (epsG >= 10 ? 2 : epsG >= 5 ? 1 : 0) : 0, note: epsG != null ? `EPS growth ${epsG.toFixed(1)}% YoY` : 'No data', weight: 2, tier: 2 };
 
         // FCF
-        if (opCFs.length > 0) {
-          const fcfs = opCFs.map((op, i) => op - (capExs[i] || 0));
-          const avgF = safeAvg(fcfs), posYrs = fcfs.filter(f => f > 0).length;
-          const growing = fcfs.length >= 2 && fcfs[0] > fcfs[fcfs.length - 1];
-          criteria.fcf = { score: posYrs === fcfs.length && growing ? 2 : posYrs >= Math.ceil(fcfs.length * 0.75) ? 1 : 0, note: `Avg FCF $${(avgF / 1e6).toFixed(0)}M, positive ${posYrs}/${fcfs.length} yr${fcfs.length > 1 ? 's' : ''}${growing ? ', growing' : ''}`, weight: 2, tier: 2 };
-        } else {
-          const f = rv(fd.freeCashflow);
-          criteria.fcf = { score: f !== null ? (f > 0 ? 1 : 0) : 0, note: f !== null ? `FCF $${(f / 1e6).toFixed(0)}M` : 'No cash flow data', weight: 2, tier: 2 };
-        }
+        const fcf = q.freeCashflow ?? null;
+        criteria.fcf = fcf != null
+          ? { score: fcf > 0 ? 1 : 0, note: `FCF $${(fcf / 1e6).toFixed(0)}M`, weight: 2, tier: 2 }
+          : { score: 0, note: 'No FCF data', weight: 2, tier: 2 };
 
         // Debt
-        const totalDebt = rv(fd.totalDebt) || bsDebt[0] || 0;
-        const totalCash = rv(fd.totalCash) || bsCash[0] || 0;
-        const ebitda    = rv(fd.ebitda);
-        if (ebitda && ebitda > 0) {
+        const de = q.debtToEquity ?? null;
+        const totalDebt = q.totalDebt ?? 0;
+        const totalCash = q.totalCash ?? 0;
+        const ebitda    = q.ebitda ?? null;
+        if (ebitda && ebitda > 0 && totalDebt !== null) {
           const ratio = (totalDebt - totalCash) / ebitda;
           criteria.debt = { score: ratio <= 0 ? 2 : ratio <= 2 ? 2 : ratio <= 3 ? 1 : 0, note: ratio <= 0 ? 'Net cash position' : `Net debt/EBITDA ${ratio.toFixed(1)}x`, weight: 2, tier: 2 };
+        } else if (de != null) {
+          criteria.debt = { score: de <= 0 ? 2 : de <= 50 ? 2 : de <= 100 ? 1 : 0, note: `Debt/equity ${de.toFixed(0)}%`, weight: 2, tier: 2 };
         } else {
-          const de = rv(fd.debtToEquity);
-          criteria.debt = de !== null ? { score: de <= 0 ? 2 : de <= 50 ? 2 : de <= 100 ? 1 : 0, note: `Debt/equity ${de.toFixed(0)}%`, weight: 2, tier: 2 } : { score: 1, note: 'Debt data insufficient', weight: 2, tier: 2 };
+          criteria.debt = { score: 1, note: 'Debt data unavailable', weight: 2, tier: 2 };
         }
 
         // Market cap
-        criteria.mktcap = marketCap !== null
+        criteria.mktcap = marketCap != null
           ? { score: marketCap >= 0.5e9 && marketCap <= 3e9 ? 2 : marketCap >= 0.3e9 && marketCap <= 5e9 ? 1 : 0, note: `Market cap $${(marketCap / 1e9).toFixed(2)}B`, weight: 2, tier: 2 }
           : { score: 0, note: 'Market cap unavailable', weight: 2, tier: 2 };
 
-        // Share count trend
-        if (bsShares.length >= 2) {
-          const oldest = bsShares[bsShares.length - 1], newest = bsShares[0];
-          const chg = oldest > 0 ? (newest - oldest) / oldest * 100 : null;
-          criteria.shares = chg !== null ? { score: chg <= 0 ? 2 : chg <= 5 ? 1 : 0, note: `Share count ${chg >= 0 ? '+' : ''}${chg.toFixed(1)}% over ${bsShares.length - 1} yr${bsShares.length > 2 ? 's' : ''}`, weight: 1, tier: 3 } : { score: 1, note: 'Share data error', weight: 1, tier: 3 };
-        } else { criteria.shares = { score: 1, note: 'Insufficient share history', weight: 1, tier: 3 }; }
+        // Share count trend (v7/quote only has current shares, not history — default neutral)
+        criteria.shares = { score: 1, note: 'Share trend requires historical data (scored neutral)', weight: 1, tier: 3 };
 
         // PEG
-        const peg = rv(ks.pegRatio) ?? rv(ks.trailingPegRatio);
-        criteria.peg = peg !== null ? { score: peg <= 0 ? 1 : peg < 1 ? 2 : peg < 2 ? 1 : 0, note: `PEG ${peg.toFixed(2)}`, weight: 1, tier: 3 } : { score: 1, note: 'PEG not available', weight: 1, tier: 3 };
+        const peg = q.pegRatio ?? q.trailingPegRatio ?? null;
+        criteria.peg = peg != null ? { score: peg <= 0 ? 1 : peg < 1 ? 2 : peg < 2 ? 1 : 0, note: `PEG ${peg.toFixed(2)}`, weight: 1, tier: 3 } : { score: 1, note: 'PEG not available', weight: 1, tier: 3 };
 
-        // Dividend (low/no preferred for compounders)
-        const payout   = rv(fd.payoutRatio) ?? rv(ks.payoutRatio);
-        const divYield = rv(fd.dividendYield) ?? 0;
+        // Dividend
+        const payout   = q.payoutRatio ?? null;
+        const divYield = q.dividendYield ?? 0;
         if ((!payout || payout === 0) && (!divYield || divYield === 0)) {
           criteria.dividend = { score: 2, note: 'No dividend — capital compounds internally', weight: 1, tier: 3 };
         } else {
           criteria.dividend = { score: (payout || 0) < 0.15 ? 2 : (payout || 0) < 0.40 ? 1 : 0, note: `Payout ${((payout || 0) * 100).toFixed(0)}%, yield ${((divYield || 0) * 100).toFixed(1)}%`, weight: 1, tier: 3 };
         }
 
-        // ROIC (approx: NOPAT / Invested Capital)
-        if (opIncomes.length > 0 && assets.length > 0) {
-          const roics = opIncomes.map((op, i) => {
-            const a = assets[i], cl = currLiabs[i] || 0, ic = a - cl;
-            return a && ic > 0 ? (op * 0.79) / ic * 100 : null;
-          }).filter(v => v !== null);
-          if (roics.length > 0) { const avg = safeAvg(roics); criteria.roic = { score: avg >= 15 ? 2 : avg >= 10 ? 1 : 0, note: `Avg ROIC ~${avg.toFixed(1)}%`, weight: 1, tier: 3 }; }
-          else criteria.roic = { score: 0, note: 'Insufficient data for ROIC', weight: 1, tier: 3 };
-        } else { criteria.roic = { score: 0, note: 'Insufficient data for ROIC', weight: 1, tier: 3 }; }
+        // ROIC (approximated from returnOnAssets if available)
+        const roa = q.returnOnAssets != null ? q.returnOnAssets * 100 : null;
+        criteria.roic = roa != null
+          ? { score: roa >= 10 ? 2 : roa >= 6 ? 1 : 0, note: `ROA ${roa.toFixed(1)}% (ROIC proxy)`, weight: 1, tier: 3 }
+          : { score: 0, note: 'Insufficient data for ROIC', weight: 1, tier: 3 };
 
-        // 5. Qual scoring via Gemini
+        // 4. Qual scoring via Gemini
         const QUAL_IDS  = ['moat', 'runway', 'cap_alloc', 'industry', 'disclosure', 'insider_buy'];
         const QUAL_META = { moat: { weight: 3, tier: 1 }, runway: { weight: 3, tier: 1 }, cap_alloc: { weight: 2, tier: 2 }, industry: { weight: 2, tier: 2 }, disclosure: { weight: 1, tier: 3 }, insider_buy: { weight: 1, tier: 3 } };
 
@@ -402,7 +328,7 @@ insider_buy: 2=net open-market buying recently, 1=neutral/insufficient data, 0=n
           for (const cid of QUAL_IDS) qualScores[cid] = { score: 1, note: `Gemini error: ${String(e.message).slice(0, 60)}`, ...QUAL_META[cid] };
         }
 
-        // 6. Combine scores
+        // 5. Combine scores
         const allCriteria = { ...criteria, ...qualScores };
         const QUAL_SET    = new Set(QUAL_IDS);
         let quantScore = 0, qualScore = 0, quantMax = 0, qualMax = 0;
@@ -433,7 +359,7 @@ insider_buy: 2=net open-market buying recently, 1=neutral/insufficient data, 0=n
           scored_at: new Date().toISOString().split('T')[0],
         };
 
-        // 7. Persist to DB (non-fatal)
+        // 6. Persist to DB (non-fatal)
         try {
           await fetch('https://labanos.dk/screener.php', {
             method: 'POST',
