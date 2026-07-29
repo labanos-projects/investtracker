@@ -14,6 +14,7 @@ on:
       - 'php/sql.php'
       - 'php/watchlists.php'
       - 'php/watchlist_items.php'
+      - 'php/screener.php'
       - '.github/workflows/deploy-php.yml'
 
 jobs:
@@ -25,7 +26,7 @@ jobs:
 
       - name: Inject secrets
         run: |
-          FILES="php/notes.php php/transactions.php php/portfolio.php php/portfolio_history.php php/db_migrate.php php/valuations.php php/sql.php php/watchlists.php php/watchlist_items.php"
+          FILES="php/notes.php php/transactions.php php/portfolio.php php/portfolio_history.php php/db_migrate.php php/valuations.php php/sql.php php/watchlists.php php/watchlist_items.php php/screener.php"
           sed -i "s|%%DB_HOST%%|${{ secrets.DB_HOST }}|g" $FILES
           sed -i "s|%%DB_NAME%%|${{ secrets.DB_NAME }}|g" $FILES
           sed -i "s|%%DB_USER%%|${{ secrets.DB_USER }}|g" $FILES
@@ -51,6 +52,7 @@ jobs:
           put php/sql.php sql.php
           put php/watchlists.php watchlists.php
           put php/watchlist_items.php watchlist_items.php
+          put php/screener.php screener.php
           SFTP
 
       - name: Done
