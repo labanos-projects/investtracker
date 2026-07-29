@@ -115,6 +115,12 @@ export async function scoreTicker(symbol, env) {
   const agg = aggregate(criteria);
   const sgr = sustainableGrowth(metrics.roic?.value, metrics.payout_ratio?.value);
 
+  // yearsToMultiple returns null for a non-positive rate. Guard on the RESULT:
+  // a negative SGR is truthy, so `sgr ? Math.round(...) : null` rounded null
+  // to 0 and rendered "0 yrs to 10×" for a company that is shrinking.
+  const y10 = yearsToMultiple(sgr, 10);
+  const y100 = yearsToMultiple(sgr, 100);
+
   return {
     ticker: symbol,
     company: parsed.company || symbol,
@@ -125,8 +131,8 @@ export async function scoreTicker(symbol, env) {
     red_flags: redFlags(criteria, { sgr }),
     // Headline multibagger metrics — the numbers you actually want on the card.
     sgr: sgr === null ? null : Math.round(sgr * 1000) / 10,
-    years_to_10x: sgr ? Math.round(yearsToMultiple(sgr, 10)) : null,
-    years_to_100x: sgr ? Math.round(yearsToMultiple(sgr, 100)) : null,
+    years_to_10x: y10 === null ? null : Math.round(y10),
+    years_to_100x: y100 === null ? null : Math.round(y100),
     mktcap_usd: metrics.mktcap_usd?.value ?? null,
     sources: ai?.sources || [],
     diagnostics: metrics._diag || {},
