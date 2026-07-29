@@ -1,5 +1,6 @@
 // v7 – fix stale intraday change%: don't trust Yahoo's regularMarketChangePercent
 // v8 – add ?score_ticker= endpoint: YF quoteSummary + Gemini qual scoring
+// v9 – fix YF 401: fetch crumb+cookie before quoteSummary
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -170,22 +171,43 @@ export default {
       }
       const symbol = scoreTickerSym.toUpperCase().trim();
       try {
-        // 1. Fetch Yahoo Finance quoteSummary
+        // 1. Get Yahoo Finance crumb + cookie (required since ~2024)
+        const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+        let crumb = '', cookieStr = '';
+        try {
+          const homeRes = await fetch('https://finance.yahoo.com/', {
+            headers: { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'en-US,en;q=0.9' },
+            redirect: 'follow',
+          });
+          // Cloudflare Workers supports headers.getAll('set-cookie')
+          const setCookies = typeof homeRes.headers.getAll === 'function'
+            ? homeRes.headers.getAll('set-cookie')
+            : (homeRes.headers.get('set-cookie') || '').split(/,(?=[^ ])/);
+          cookieStr = setCookies.map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
+
+          const crumbRes = await fetch('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+            headers: { 'User-Agent': UA, 'Cookie': cookieStr },
+          });
+          if (crumbRes.ok) crumb = (await crumbRes.text()).trim();
+        } catch (_) { /* proceed without crumb — might still work */ }
+
+        // 2. Fetch Yahoo Finance quoteSummary
         const modules = [
           'incomeStatementHistory', 'balanceSheetHistory',
           'cashflowStatementHistory', 'defaultKeyStatistics',
           'financialData', 'assetProfile', 'quoteType', 'price',
         ].join(',');
-        const yfSummaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${encodeURIComponent(modules)}&ssl=true`;
+        const crumbParam = crumb ? `&crumb=${encodeURIComponent(crumb)}` : '';
+        const yfSummaryUrl = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${encodeURIComponent(modules)}${crumbParam}`;
         const yfRes = await fetch(yfSummaryUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept': 'application/json' },
+          headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Cookie': cookieStr },
         });
         if (!yfRes.ok) throw new Error(`Yahoo Finance ${yfRes.status} for ${symbol}`);
         const yfData  = await yfRes.json();
         const summary = yfData?.quoteSummary?.result?.[0];
         if (!summary) throw new Error(`Ticker ${symbol} not found — check symbol`);
 
-        // 2. Extract modules
+        // 3. Extract modules
         const fd  = summary.financialData || {};
         const ks  = summary.defaultKeyStatistics || {};
         const ap  = summary.assetProfile || {};
@@ -225,7 +247,7 @@ export default {
         const opCFs      = cf.map(s => rv(s.totalCashFromOperatingActivities)).filter(v => v !== null);
         const capExs     = cf.map(s => Math.abs(rv(s.capitalExpenditures) || 0));
 
-        // 3. Score quant criteria
+        // 4. Score quant criteria
         const criteria = {};
 
         // ROE
@@ -334,7 +356,7 @@ export default {
           else criteria.roic = { score: 0, note: 'Insufficient data for ROIC', weight: 1, tier: 3 };
         } else { criteria.roic = { score: 0, note: 'Insufficient data for ROIC', weight: 1, tier: 3 }; }
 
-        // 4. Qual scoring via Gemini
+        // 5. Qual scoring via Gemini
         const QUAL_IDS  = ['moat', 'runway', 'cap_alloc', 'industry', 'disclosure', 'insider_buy'];
         const QUAL_META = { moat: { weight: 3, tier: 1 }, runway: { weight: 3, tier: 1 }, cap_alloc: { weight: 2, tier: 2 }, industry: { weight: 2, tier: 2 }, disclosure: { weight: 1, tier: 3 }, insider_buy: { weight: 1, tier: 3 } };
 
@@ -380,7 +402,7 @@ insider_buy: 2=net open-market buying recently, 1=neutral/insufficient data, 0=n
           for (const cid of QUAL_IDS) qualScores[cid] = { score: 1, note: `Gemini error: ${String(e.message).slice(0, 60)}`, ...QUAL_META[cid] };
         }
 
-        // 5. Combine scores
+        // 6. Combine scores
         const allCriteria = { ...criteria, ...qualScores };
         const QUAL_SET    = new Set(QUAL_IDS);
         let quantScore = 0, qualScore = 0, quantMax = 0, qualMax = 0;
@@ -411,7 +433,7 @@ insider_buy: 2=net open-market buying recently, 1=neutral/insufficient data, 0=n
           scored_at: new Date().toISOString().split('T')[0],
         };
 
-        // 6. Persist to DB (non-fatal)
+        // 7. Persist to DB (non-fatal)
         try {
           await fetch('https://labanos.dk/screener.php', {
             method: 'POST',
