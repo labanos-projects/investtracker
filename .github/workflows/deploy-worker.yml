@@ -4,8 +4,10 @@ on:
   push:
     branches: [master]
     paths:
-      - 'cloudflare/worker.js'
-      - 'cloudflare/wrangler.toml'
+      # Must stay a directory glob. Listing individual files meant the
+      # screener_*.js modules were not deploy triggers, so fixes to them
+      # landed on master and never shipped.
+      - 'cloudflare/**'
 
 jobs:
   deploy:
