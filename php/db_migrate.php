@@ -149,4 +149,64 @@ function run_migrations($pdo) {
             $pdo->prepare("DELETE FROM portfolios          WHERE id = ?")->execute([$row['id']]);
         }
     }
+
+    // 10. screener_results — moved here from screener.php's inline bootstrap
+    $pdo->exec("CREATE TABLE IF NOT EXISTS screener_results (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        ticker      VARCHAR(20)  NOT NULL,
+        company     VARCHAR(255),
+        sector      VARCHAR(100),
+        industry    VARCHAR(100),
+        score_data  JSON         NOT NULL,
+        quant_score DECIMAL(5,2),
+        quant_max   INT          NOT NULL DEFAULT 48,
+        qual_score  DECIMAL(5,2),
+        qual_max    INT          NOT NULL DEFAULT 24,
+        total_score DECIMAL(5,2),
+        max_score   INT          NOT NULL DEFAULT 72,
+        pct         DECIMAL(5,2),
+        conviction  VARCHAR(50),
+        red_flags   JSON,
+        scored_at   DATE         NOT NULL,
+        created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+        updated_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY  unique_ticker (ticker),
+        INDEX       idx_pct (pct),
+        INDEX       idx_scored_at (scored_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // 11. screener v2 — coverage, provenance and multibagger headline metrics.
+    //
+    //     max_score is no longer a fixed 72. Criteria with no data score null
+    //     and drop out of the denominator entirely, so the same ticker can be
+    //     scored out of 66 one day and 54 the next. coverage_pct records how
+    //     much of the rubric actually had data behind it, and the UI refuses to
+    //     show a conviction below 70% coverage.
+    $screenerCols = [
+        'coverage_pct'  => "DECIMAL(5,2) NULL AFTER pct",
+        'sgr'           => "DECIMAL(7,2) NULL AFTER coverage_pct",   // sustainable growth rate, %
+        'years_to_10x'  => "SMALLINT NULL AFTER sgr",
+        'years_to_100x' => "SMALLINT NULL AFTER years_to_10x",
+        'mktcap_usd'    => "DECIMAL(20,2) NULL AFTER years_to_100x",
+        'sources'       => "JSON NULL AFTER red_flags",              // grounding citations
+        'diagnostics'   => "JSON NULL AFTER sources",                // which providers answered
+    ];
+    foreach ($screenerCols as $col => $ddl) {
+        if (!$hasCol('screener_results', $col)) {
+            try { $pdo->exec("ALTER TABLE screener_results ADD COLUMN `$col` $ddl"); }
+            catch (Exception $e) { /* raced with another request — fine */ }
+        }
+    }
+
+    // 12. Legacy screener rows were produced by the pre-v11 scorer, whose
+    //     `parseInt(x) || 1` collapse made every genuine 0 into a 1 and put a
+    //     hard floor of 50% under every score. Those numbers are not comparable
+    //     with v11 output, so mark them rather than silently mixing the two.
+    if ($hasCol('screener_results', 'coverage_pct')) {
+        try {
+            $pdo->exec("UPDATE screener_results
+                        SET conviction = 'STALE — RESCORE'
+                        WHERE coverage_pct IS NULL AND max_score = 72");
+        } catch (Exception $e) {}
+    }
 }
