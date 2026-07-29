@@ -1,3 +1,5 @@
+# worker.js imports ./screener_{engine,data,score}.js — wrangler bundles them
+# via esbuild. Deploys are triggered by any change under cloudflare/.
 name            = "yf-proxy"
 main            = "worker.js"
 compatibility_date = "2025-01-01"
