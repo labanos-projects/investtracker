@@ -1,4 +1,4 @@
-// ─── App ───────────────────────────────────────────────────────────────────
+// ─── App ─────────────────────────────────────────────────────────────────────────────
 function App() {
   const [prices, setPrices]           = useState({});
   const [fx, setFx]                   = useState(CACHED_FX);
@@ -15,12 +15,12 @@ function App() {
   const [showInsights,  setShowInsights]  = useState(false);
   const [showHistory,   setShowHistory]   = useState(false);
   const [metaLoading,   setMetaLoading]   = useState(0);
-  const metaAttempted      = React.useRef(new Set()); // IDs attempted this session
-  const snapshotRecorded   = React.useRef(new Set()); // portfolioIds snapshotted this session
+  const metaAttempted      = React.useRef(new Set());
+  const snapshotRecorded   = React.useRef(new Set());
 
   // ── Portfolios state ──
   const [portfolios,    setPortfolios]    = useState([]);
-  const [portfolioId,   setPortfolioId]   = useState(null); // currently selected portfolio id
+  const [portfolioId,   setPortfolioId]   = useState(null);
   const [baseCcy,       setBaseCcy]       = useState('DKK');
   const [pfListLoaded,  setPfListLoaded]  = useState(false);
 
@@ -30,14 +30,14 @@ function App() {
   const [watchlistId,  setWatchlistId]  = useState(null);
 
   // ── Auth state ──
-  const [user,         setUser]         = useState(null);   // null = not logged in
-  const [authChecked,  setAuthChecked]  = useState(false);  // prevents flash
+  const [user,         setUser]         = useState(null);
+  const [authChecked,  setAuthChecked]  = useState(false);
   const [setupNeeded,  setSetupNeeded]  = useState(false);
   const [showLogin,    setShowLogin]    = useState(false);
-  const [pendingAction, setPendingAction] = useState(null); // action to run after login
+  const [pendingAction, setPendingAction] = useState(null);
 
-  // ── Portfolio from DB ─────────────────────────────────────────────────
-  const portfolioRef = React.useRef([]); // used inside fetchPrices
+  // ── Portfolio from DB ────────────────────────────────────────────────────────────────
+  const portfolioRef = React.useRef([]);
   const [portfolio,       setPortfolio]       = useState([]);
   const [portfolioLoaded, setPortfolioLoaded] = useState(false);
 
@@ -58,28 +58,19 @@ function App() {
       });
   }, [portfolioId]);
 
-  // Keep ref in sync whenever portfolio state changes
   useEffect(() => { if (portfolio.length > 0) portfolioRef.current = portfolio; }, [portfolio]);
-
-  // Persist active view across reloads
   useEffect(() => { localStorage.setItem('tracker_view', view); }, [view]);
 
-  // ── Fetch + cache sector/country metadata for holdings that lack it ──
+  // ── Fetch + cache sector/country metadata ──
   useEffect(() => {
     if (!portfolioLoaded || portfolio.length === 0) return;
-    // Include 'Unknown' so holdings enriched with the old broken proxy get re-enriched.
-    // metaAttempted ref prevents infinite retries for tickers that are genuinely unknown.
     const missing = portfolio.filter(p =>
       p.id && (p.sector == null || p.sector === 'Unknown' || !p.company) && !metaAttempted.current.has(p.id)
     );
     if (missing.length === 0) return;
-
-    // Mark all as attempted before any async work to avoid duplicate fetches
     missing.forEach(h => metaAttempted.current.add(h.id));
-
     let cancelled = false;
     setMetaLoading(missing.length);
-
     missing.forEach(async (holding) => {
       try {
         const c = new AbortController();
@@ -94,10 +85,8 @@ function App() {
         const sector  = metaJson?.sector  || 'Unknown';
         const country = metaJson?.country || 'Unknown';
         const update  = { sector, country };
-        // Fill in company name if it's missing and FMP returned one
         if (!holding.company && metaJson?.companyName) update.company = metaJson.companyName;
         setPortfolio(prev => prev.map(p => p.id === holding.id ? { ...p, ...update } : p));
-        // Persist to DB so subsequent loads skip this fetch
         fetch(`${PORTFOLIO_API}?_method=PUT&id=${holding.id}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -106,7 +95,6 @@ function App() {
       } catch (e) {
         if (!cancelled) {
           setPortfolio(prev => prev.map(p => p.id === holding.id ? { ...p, sector: 'Unknown', country: 'Unknown' } : p));
-          // Only persist sector/country as Unknown — don't overwrite a blank company with nothing useful
           if (holding.sector == null || holding.sector === 'Unknown') {
             fetch(`${PORTFOLIO_API}?_method=PUT&id=${holding.id}`, {
               method: 'POST',
@@ -122,7 +110,7 @@ function App() {
     return () => { cancelled = true; setMetaLoading(0); };
   }, [portfolioLoaded, portfolioId]);
 
-  // ── Load portfolio list on mount (public — no auth required) ──
+  // ── Load portfolio list on mount ──
   useEffect(() => {
     fetch(PORTFOLIOS_API)
       .then(r => r.ok ? r.json() : [])
@@ -140,7 +128,7 @@ function App() {
       .catch(() => setPfListLoaded(true));
   }, []);
 
-  // ── Load watchlists on mount (public read) ──
+  // ── Load watchlists on mount ──
   useEffect(() => {
     fetch(WATCHLISTS_API)
       .then(r => r.ok ? r.json() : [])
@@ -163,7 +151,6 @@ function App() {
   // ── Auth: check setup + restore session on mount ──
   useEffect(() => {
     const token = localStorage.getItem('auth_token');
-    // Always check setup status first
     fetch(`${AUTH_API}?setup_check=1`)
       .then(r => r.ok ? r.json() : { setupNeeded: false })
       .then(data => {
@@ -172,7 +159,6 @@ function App() {
           setAuthChecked(true);
           return;
         }
-        // Restore session if token exists
         if (token) {
           return fetch(AUTH_API, { headers: { Authorization: `Bearer ${token}` } })
             .then(r => { if (!r.ok) { localStorage.removeItem('auth_token'); return null; } return r.json(); })
@@ -194,7 +180,6 @@ function App() {
     } else if (pf._rename) {
       setPortfolios(prev => prev.map(p => p.id === pf.id ? { ...p, name: pf.name } : p));
     } else {
-      // new portfolio created
       setPortfolios(prev => [...prev, pf]);
       switchPortfolio(pf.id, pf.base_currency);
     }
@@ -204,7 +189,6 @@ function App() {
     setPortfolioId(id);
     if (ccy) setBaseCcy(ccy);
     localStorage.setItem('selected_portfolio_id', id);
-    // Reset all portfolio-scoped state so it reloads for the new portfolio
     setPortfolio([]);
     setPortfolioLoaded(false);
     setAllTxns({});
@@ -253,8 +237,7 @@ function App() {
     setUser(null);
   }, []);
 
-  // ── Transactions from DB ──────────────────────────────────────────────
-  // allTxns: { [ticker]: [{id, date, type, shares, price, fees, note}, ...] }
+  // ── Transactions from DB ────────────────────────────────────────────────────────────────
   const [allTxns,    setAllTxns]    = useState({});
   const [txnsLoaded, setTxnsLoaded] = useState(false);
 
@@ -263,50 +246,35 @@ function App() {
     fetch(`${TRANSACTIONS_API}?portfolio_id=${portfolioId}`)
       .then(r => r.ok ? r.json() : [])
       .then(async rows => {
-        // Group by ticker
         const grouped = {};
         rows.forEach(t => { (grouped[t.ticker] = grouped[t.ticker] || []).push(t); });
-
         setAllTxns(grouped);
         setTxnsLoaded(true);
       })
-      .catch(() => {
-        setAllTxns({});
-        setTxnsLoaded(true);
-      });
+      .catch(() => { setAllTxns({}); setTxnsLoaded(true); });
   }, [portfolioId]);
 
-  // Called by DetailPage when it adds/edits/deletes a transaction
   const handleTxnsChanged = useCallback((ticker, updatedTxns) => {
     setAllTxns(prev => ({ ...prev, [ticker]: updatedTxns }));
   }, []);
 
-  // Called when a holding is removed from DetailPage
   const handleRemoveHolding = useCallback((ticker) => {
     setPortfolio(prev => {
       const next = prev.filter(p => p.ticker !== ticker);
       portfolioRef.current = next;
       return next;
     });
-    setAllTxns(prev => {
-      const next = { ...prev };
-      delete next[ticker];
-      return next;
-    });
+    setAllTxns(prev => { const next = { ...prev }; delete next[ticker]; return next; });
     setSelectedTicker(null);
   }, []);
 
-  // Called when a new holding is added via AddHoldingModal
   const handlePortfolioChanged = useCallback((newPfItem, firstTxn) => {
     setPortfolio(prev => {
       const next = [...prev, newPfItem];
       portfolioRef.current = next;
       return next;
     });
-    if (firstTxn) {
-      setAllTxns(prev => ({ ...prev, [newPfItem.ticker]: [firstTxn] }));
-    }
-    // Re-fetch prices so the new ticker appears live
+    if (firstTxn) setAllTxns(prev => ({ ...prev, [newPfItem.ticker]: [firstTxn] }));
     setTimeout(() => fetchPrices(true), 200);
   }, []);
 
@@ -321,11 +289,10 @@ function App() {
     const workerUrl = `${WORKER_URL}?symbols=${symbols}`;
     const apiUrl    = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${symbols}&fields=regularMarketPrice,regularMarketChangePercent`;
 
-    // Try worker first (Cloudflare proxy bypasses CORS/auth), then fall back
     const sources = [
-      workerUrl,                                                                  // Cloudflare Worker (primary)
-      apiUrl,                                                                     // direct (works in some browsers)
-      `https://corsproxy.io/?${encodeURIComponent(apiUrl)}`,                     // proxy 1
+      workerUrl,
+      apiUrl,
+      `https://corsproxy.io/?${encodeURIComponent(apiUrl)}`,
     ];
 
     let rows = null;
@@ -356,10 +323,10 @@ function App() {
       setPrices(newPrices);
       setFx(newFx);
       setIsLive(true);
-      setLastUpdated(new Date());           // actual time of successful fetch
+      setLastUpdated(new Date());
     } else {
       setIsLive(false);
-      setLastUpdated(CACHED_AS_OF);         // time the cached prices were recorded
+      setLastUpdated(CACHED_AS_OF);
       if (Object.keys(prices).length === 0) {
         const cached = {};
         pf.forEach(p => { cached[p.yhTicker] = { price: p.cachedPrice || 0, chgPct: p.cachedChg || 0 }; });
@@ -371,7 +338,6 @@ function App() {
     setRefreshing(false);
   }, []);
 
-  // Trigger price fetch once portfolio is loaded, then poll every 5 min
   useEffect(() => {
     if (!portfolioLoaded) return;
     fetchPrices();
@@ -379,7 +345,6 @@ function App() {
     return () => clearInterval(iv);
   }, [portfolioLoaded]);
 
-  // Enrich each position — shares/avgCost derived from DB transactions
   const enriched = portfolio.map(p => {
     const { shares, avgCost } = computePosition(allTxns[p.ticker] || []);
     const pd         = prices[p.yhTicker] || { price: p.cachedPrice, chgPct: p.cachedChg };
@@ -403,7 +368,6 @@ function App() {
 
   const withWeight = enriched.map(p => ({ ...p, weight: totalValue > 0 ? p.valueBase / totalValue : 0 }));
 
-  // ── Record daily portfolio snapshot (once per portfolio per session, live prices only) ──
   useEffect(() => {
     if (!user || !portfolioId || !isLive || totalValue <= 0) return;
     if (snapshotRecorded.current.has(portfolioId)) return;
@@ -415,11 +379,9 @@ function App() {
     }).catch(() => {});
   }, [user, portfolioId, isLive, totalValue, baseCcy]);
 
-  // ── Split active vs closed positions ──
   const activePositions = withWeight.filter(p => p.shares > 0);
   const closedPositions = withWeight.filter(p => p.shares === 0);
 
-  // ── Detail page navigation (works for both active and closed positions) ──
   if (selectedTicker) {
     const pos = withWeight.find(p => p.ticker === selectedTicker);
     if (pos) return (
@@ -450,12 +412,8 @@ function App() {
   const sortedClosed = [...closedPositions].sort(sortFn);
 
   const handleSort = (col) => {
-    if (col === sortBy) {
-      setSortDir(d => d === 'desc' ? 'asc' : 'desc');
-    } else {
-      setSortBy(col);
-      setSortDir('desc');
-    }
+    if (col === sortBy) { setSortDir(d => d === 'desc' ? 'asc' : 'desc'); }
+    else { setSortBy(col); setSortDir('desc'); }
   };
 
   const SortBtn = ({ col, label }) => (
@@ -476,11 +434,8 @@ function App() {
   };
 
   const handleAddClick = () => {
-    if (view === 'watchlist') {
-      requireLogin(() => setShowAddModal(true));
-    } else {
-      setShowAddModal(true);
-    }
+    if (view === 'watchlist') { requireLogin(() => setShowAddModal(true)); }
+    else { setShowAddModal(true); }
   };
 
   return (
@@ -502,6 +457,8 @@ function App() {
             ) : (
               <span className="font-semibold text-[15px]">Portfolio</span>
             )
+          ) : view === 'screener' ? (
+            <span className="font-semibold text-[15px]">Screener</span>
           ) : (
             <span className="font-semibold text-[15px]">Watchlist</span>
           )}
@@ -526,7 +483,7 @@ function App() {
               Sign in
             </button>
           ) : null}
-          {user && (
+          {user && view !== 'screener' && (
           <button
             onClick={handleAddClick}
             title={view === 'watchlist' ? 'Add symbol to watchlist' : 'Add new holding'}
@@ -551,6 +508,7 @@ function App() {
         {[
           ['portfolio', 'Holdings'],
           ['watchlist', 'Watchlist'],
+          ['screener',  'Screener'],
         ].map(([v, label]) => (
           <button key={v} onClick={() => setView(v)}
             className={`text-[11px] font-semibold px-2.5 py-1 rounded-full transition-colors ${
@@ -589,7 +547,7 @@ function App() {
             <span className="text-sm">No watchlist yet.</span>
             {user && (
               <p className="text-[12px] max-w-xs">
-                Once you have a watchlist set up on the server, this is where it'll show up. (The migration creates one automatically.)
+                Once you have a watchlist set up on the server, this is where it'll show up.
               </p>
             )}
           </div>
@@ -604,6 +562,11 @@ function App() {
             setShowAddModal={setShowAddModal}
           />
         )
+      )}
+
+      {/* ── Screener view ── */}
+      {view === 'screener' && (
+        <ScreenerView user={user} onRequireLogin={requireLogin} />
       )}
 
       {/* ── Portfolio view ── */}
@@ -651,7 +614,6 @@ function App() {
                   <div className={`font-bold mono text-base leading-tight ${clr(totalGL)}`}>{pct(totalGLPct)}</div>
                   <div className={`text-[11px] mono ${clr(totalGL)}`}>{signed(totalGL,0)} {baseCcy}</div>
                 </div>
-                {/* icon buttons stacked */}
                 <div className="flex flex-col border-l border-gray-100 divide-y divide-gray-100">
                   <button
                     onClick={() => { setShowHistory(v => !v); setShowInsights(false); }}
@@ -660,7 +622,6 @@ function App() {
                       showHistory ? 'bg-gray-900 text-white' : 'text-gray-400 hover:text-gray-700 hover:bg-gray-50'
                     }`}
                   >
-                    {/* line chart icon */}
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                       <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
                     </svg>
@@ -710,7 +671,6 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {/* Active positions */}
                     {sortedActive.map((p, i) => (
                       <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)} className={`border-b border-gray-100 cursor-pointer transition-colors ${i%2===0 ? 'bg-white hover:bg-blue-50' : 'bg-gray-50/60 hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 min-w-[110px]">
@@ -735,7 +695,6 @@ function App() {
                       </tr>
                     ))}
 
-                    {/* Closed positions toggle row */}
                     {closedPositions.length > 0 && (
                       <tr className="border-t border-gray-200 bg-gray-50/50">
                         <td colSpan={5}>
@@ -750,7 +709,6 @@ function App() {
                       </tr>
                     )}
 
-                    {/* Closed positions rows */}
                     {showClosed && sortedClosed.map((p) => (
                       <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)}
                         className="border-b border-gray-50 cursor-pointer bg-gray-50/30 hover:bg-blue-50 opacity-50">
