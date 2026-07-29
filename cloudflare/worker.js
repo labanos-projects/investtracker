@@ -1,6 +1,11 @@
 // v7 – fix stale intraday change%: don't trust Yahoo's regularMarketChangePercent
 // v8 – add ?score_ticker= endpoint
 // v10 – Gemini scores all 18 criteria (YF blocks fundamental data from CF Workers)
+// v11 – screener rework: computed fundamentals (EDGAR/Yahoo/FMP) + grounded AI,
+//       0/1/2/null scoring with a dynamic denominator, multibagger rubric.
+//       Scoring logic now lives in screener_{engine,data,score}.js.
+import { scoreTicker } from './screener_score.js';
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -161,6 +166,10 @@ export default {
     }
 
     // ── Screener: score a ticker ───────────────────────────────────────────────────────────
+    // Scoring lives in screener_score.js. Quantitative criteria are computed
+    // from filings (EDGAR → Yahoo → FMP, per field); only the six qualitative
+    // criteria go to Gemini, search-grounded. Missing data scores null and is
+    // excluded from the denominator rather than defaulting to a passing 1.
     const scoreTickerSym = url.searchParams.get('score_ticker');
     if (scoreTickerSym) {
       const authHeader = request.headers.get('Authorization') || '';
@@ -171,112 +180,7 @@ export default {
       }
       const symbol = scoreTickerSym.toUpperCase().trim();
       try {
-        // Single Gemini call scores all 18 criteria + provides company metadata
-        const scoringPrompt = `You are a professional equity analyst. Using your knowledge of publicly available financial data, assess the stock with ticker "${symbol}" on 18 investment criteria.
-
-First identify the company. Then score each criterion 0, 1, or 2:
-- 2 = clearly meets the bar
-- 1 = partial / uncertain / insufficient data
-- 0 = fails or red flag
-
-Quantitative criteria (based on recent financials, last 3 years where possible):
-- roe: Return on equity. 2=avg>=20%, 1=avg>=15%, 0=<15%
-- rev_growth: Revenue CAGR. 2=>=10%/yr, 1=5-10%, 0=<5%
-- gross_margin: Gross margin vs sector benchmark. 2=>5pp above sector, 1=within 5pp, 0=>5pp below
-- insider_own: Insider ownership %. 2=>=10%, 1=5-10%, 0=<5%
-- eps_growth: EPS growth. 2=>=10%/yr, 1=5-10%, 0=<5% or negative
-- fcf: Free cash flow. 2=positive & growing, 1=positive, 0=negative
-- debt: Leverage. 2=net cash or net debt/EBITDA<=2x, 1=2-3x, 0=>3x
-- mktcap: Market cap. 2=$500M-$3B, 1=$300M-$5B, 0=outside range
-- shares: Share count trend. 2=declining (buybacks), 1=stable, 0=diluting
-- peg: PEG ratio. 2=<1, 1=1-2, 0=>2 or N/A
-- dividend: Payout ratio (compounders prefer low/no dividend). 2=no dividend, 1=payout<40%, 0=payout>=40%
-- roic: Return on invested capital. 2=>=15%, 1=10-15%, 0=<10%
-
-Qualitative criteria:
-- moat: Competitive moat durability. 2=wide 20+yr, 1=narrow ~10yr, 0=no moat
-- runway: Growth runway / TAM. 2=large underpenetrated TAM, 1=some growth left, 0=saturated
-- cap_alloc: Capital allocation quality. 2=excellent, 1=mixed, 0=value-destroying
-- industry: Industry stability. 2=slow-changing for decades, 1=some flux but stable 5-10yr, 0=disruption risk within 5yr
-- disclosure: Management transparency. 2=clear & candid, 1=adequate, 0=opaque or restatements
-- insider_buy: Insider buying behaviour. 2=net open-market buyers, 1=neutral, 0=net sellers
-
-Respond ONLY with flat JSON (no markdown, no extra text):
-{"company":"...","sector":"...","industry":"...","roe_score":1,"roe_why":"...","rev_growth_score":1,"rev_growth_why":"...","gross_margin_score":1,"gross_margin_why":"...","insider_own_score":1,"insider_own_why":"...","eps_growth_score":1,"eps_growth_why":"...","fcf_score":1,"fcf_why":"...","debt_score":1,"debt_why":"...","mktcap_score":1,"mktcap_why":"...","shares_score":1,"shares_why":"...","peg_score":1,"peg_why":"...","dividend_score":1,"dividend_why":"...","roic_score":1,"roic_why":"...","moat_score":1,"moat_why":"...","runway_score":1,"runway_why":"...","cap_alloc_score":1,"cap_alloc_why":"...","industry_score":1,"industry_why":"...","disclosure_score":1,"disclosure_why":"...","insider_buy_score":1,"insider_buy_why":"..."}`;
-
-        const gRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text: scoringPrompt }] }], generationConfig: { temperature: 0.2, maxOutputTokens: 8192 } }) }
-        );
-        if (!gRes.ok) {
-          const e = await gRes.json().catch(() => ({}));
-          throw new Error(`Gemini ${gRes.status}: ${e?.error?.message || 'unknown'}`);
-        }
-        const gData  = await gRes.json();
-        const gParts = gData.candidates?.[0]?.content?.parts || [];
-        const rawText = gParts.filter(p => !p.thought).map(p => p.text || '').join('');
-
-        let parsed = null;
-        const cleaned = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-        try { parsed = JSON.parse(cleaned); } catch {
-          const m = cleaned.match(/\{[\s\S]*\}/);
-          if (m) { try { parsed = JSON.parse(m[0]); } catch { try { parsed = JSON.parse(m[0].replace(/,\s*([}\]])/g, '$1')); } catch {} } }
-        }
-        if (!parsed) throw new Error('Gemini returned unparseable JSON');
-
-        // Build structured criteria from parsed response
-        const QUANT_META = {
-          roe:          { weight: 3, tier: 1 }, rev_growth:  { weight: 3, tier: 1 },
-          gross_margin: { weight: 3, tier: 1 }, insider_own: { weight: 3, tier: 1 },
-          eps_growth:   { weight: 2, tier: 2 }, fcf:         { weight: 2, tier: 2 },
-          debt:         { weight: 2, tier: 2 }, mktcap:      { weight: 2, tier: 2 },
-          shares:       { weight: 1, tier: 3 }, peg:         { weight: 1, tier: 3 },
-          dividend:     { weight: 1, tier: 3 }, roic:        { weight: 1, tier: 3 },
-        };
-        const QUAL_META = {
-          moat:       { weight: 3, tier: 1 }, runway:     { weight: 3, tier: 1 },
-          cap_alloc:  { weight: 2, tier: 2 }, industry:   { weight: 2, tier: 2 },
-          disclosure: { weight: 1, tier: 3 }, insider_buy:{ weight: 1, tier: 3 },
-        };
-
-        const criteria = {};
-        for (const [id, meta] of Object.entries({ ...QUANT_META, ...QUAL_META })) {
-          const score = Math.min(2, Math.max(0, parseInt(parsed[`${id}_score`]) || 1));
-          const note  = parsed[`${id}_why`] || 'AI assessed';
-          criteria[id] = { score, note, ...meta };
-        }
-
-        const QUAL_SET = new Set(Object.keys(QUAL_META));
-        let quantScore = 0, qualScore = 0, quantMax = 0, qualMax = 0;
-        for (const [id, c] of Object.entries(criteria)) {
-          if (QUAL_SET.has(id)) { qualScore  += c.score * c.weight; qualMax  += c.weight * 2; }
-          else                   { quantScore += c.score * c.weight; quantMax += c.weight * 2; }
-        }
-        const total    = quantScore + qualScore;
-        const maxTotal = quantMax + qualMax;
-        const pctVal   = maxTotal > 0 ? (total / maxTotal) * 100 : 0;
-        const conviction = pctVal >= 75 ? 'STRONG BUY' : pctVal >= 56 ? 'WATCH' : 'PASS';
-        const company  = parsed.company || symbol;
-        const sector   = parsed.sector  || '';
-        const industry = parsed.industry || '';
-
-        const redFlags = [];
-        if ((criteria.roe?.score        || 0) === 0) redFlags.push('ROE below 15%');
-        if ((criteria.rev_growth?.score || 0) === 0) redFlags.push('Revenue growth < 5%');
-        if ((criteria.debt?.score       || 0) === 0) redFlags.push('High debt load');
-        if ((criteria.moat?.score       || 0) === 0) redFlags.push('No identifiable moat');
-
-        const scoreResult = {
-          ticker: symbol, company, sector, industry,
-          criteria,
-          quant_score: quantScore, quant_max: quantMax,
-          qual_score: qualScore,  qual_max: qualMax,
-          total, max: maxTotal,
-          pct: Math.round(pctVal * 10) / 10,
-          conviction, red_flags: redFlags,
-          scored_at: new Date().toISOString().split('T')[0],
-        };
+        const scoreResult = await scoreTicker(symbol, env);
 
         // Persist to DB (non-fatal)
         try {

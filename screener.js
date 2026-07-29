@@ -67,7 +67,9 @@ function ScreenerView({ user, onRequireLogin }) {
             quant_score: data.quant_score, quant_max: data.quant_max,
             qual_score: data.qual_score,   qual_max: data.qual_max,
             total_score: data.total, max_score: data.max,
-            pct: data.pct, conviction: data.conviction,
+            pct: data.pct, coverage_pct: data.coverage,
+            sgr: data.sgr, years_to_10x: data.years_to_10x,
+            conviction: data.conviction,
             red_flags: data.red_flags, scored_at: data.scored_at,
           },
           ...prev.filter(h => h.ticker !== data.ticker),
@@ -177,7 +179,7 @@ function ScreenerView({ user, onRequireLogin }) {
         {loading && (
           <div className="mt-2.5 text-xs text-gray-400 flex items-center gap-1.5">
             <span className="spin inline-block">↻</span>
-            Fetching financials + AI assessment — ~15–20 seconds
+            Pulling filings (EDGAR / Yahoo) + grounded AI research — ~20–30 seconds
           </div>
         )}
         {!user && (
@@ -211,12 +213,18 @@ function ScreenerView({ user, onRequireLogin }) {
           <div className="divide-y divide-gray-50">
             {history.map(h => {
               const pctNum = parseFloat(h.pct) || 0;
-              const barCls  = pctNum >= 75 ? 'bg-emerald-500' : pctNum >= 56 ? 'bg-amber-400' : 'bg-red-400';
-              const badgeCls = h.conviction?.includes('STRONG')
-                ? 'bg-emerald-100 text-emerald-600'
-                : h.conviction?.includes('WATCH')
-                  ? 'bg-amber-100 text-amber-600'
-                  : 'bg-red-50 text-red-400';
+              const stale  = h.conviction?.includes('STALE');
+              const barCls  = stale ? 'bg-gray-300'
+                : pctNum >= 70 ? 'bg-emerald-500' : pctNum >= 50 ? 'bg-amber-400' : 'bg-red-400';
+              const badgeCls = stale
+                ? 'bg-gray-100 text-gray-400'
+                : h.conviction?.includes('STRONG')
+                  ? 'bg-emerald-100 text-emerald-600'
+                  : h.conviction?.includes('WATCH')
+                    ? 'bg-amber-100 text-amber-600'
+                    : h.conviction?.includes('INSUFFICIENT')
+                      ? 'bg-gray-100 text-gray-500'
+                      : 'bg-red-50 text-red-400';
               return (
                 <div
                   key={h.ticker}
@@ -235,13 +243,14 @@ function ScreenerView({ user, onRequireLogin }) {
                     </div>
                     <div className="text-[11px] text-gray-400 truncate mb-1.5">
                       {h.company}{h.sector ? ` · ${h.sector}` : ''}
+                      {h.years_to_10x ? ` · ~${h.years_to_10x}yr to 10×` : ''}
                     </div>
                     <div className="w-full bg-gray-100 rounded-full h-1">
                       <div className={`${barCls} h-1 rounded-full`} style={{ width: `${Math.min(100, pctNum)}%` }} />
                     </div>
                   </div>
                   <div className="text-right shrink-0">
-                    <div className="font-bold mono text-sm text-gray-800">{pctNum.toFixed(0)}%</div>
+                    <div className="font-bold mono text-sm text-gray-800">{stale ? '—' : `${pctNum.toFixed(0)}%`}</div>
                     <div className="text-[10px] text-gray-300 mono">{h.total_score}/{h.max_score}</div>
                   </div>
                   {user && (
@@ -261,14 +270,46 @@ function ScreenerView({ user, onRequireLogin }) {
   );
 }
 
+// ─── Shared presentation helpers ──────────────────────────────────────────────
+// A criterion with score === null had NO DATA. It is excluded from both the
+// numerator and the denominator, so it must not render like a failure — that
+// conflation is exactly what the old model got wrong.
+const SCORE_SYM = { 2: '✓', 1: '∼', 0: '✗', null: '–' };
+const SCORE_CLS = { 2: 'text-emerald-500', 1: 'text-amber-500', 0: 'text-red-400', null: 'text-gray-300' };
+
+const SOURCE_LABEL = {
+  edgar: 'EDGAR', 'edgar+yahoo': 'EDGAR', yahoo: 'Yahoo', fmp: 'FMP',
+  'ai-grounded': 'AI', computed: 'calc', none: 'no data',
+};
+const SOURCE_CLS = {
+  edgar: 'bg-emerald-50 text-emerald-600', 'edgar+yahoo': 'bg-emerald-50 text-emerald-600',
+  yahoo: 'bg-blue-50 text-blue-500', fmp: 'bg-blue-50 text-blue-500',
+  'ai-grounded': 'bg-purple-50 text-purple-500', computed: 'bg-gray-100 text-gray-500',
+  none: 'bg-gray-50 text-gray-300',
+};
+
+function pctColour(pct, conviction) {
+  if (conviction?.includes('INSUFFICIENT') || conviction?.includes('STALE')) return 'text-gray-400';
+  return pct >= 70 ? 'text-emerald-500' : pct >= 50 ? 'text-amber-500' : 'text-red-400';
+}
+function barColour(pct, conviction) {
+  if (conviction?.includes('INSUFFICIENT') || conviction?.includes('STALE')) return 'bg-gray-300';
+  return pct >= 70 ? 'bg-emerald-500' : pct >= 50 ? 'bg-amber-400' : 'bg-red-400';
+}
+function badgeColour(conviction) {
+  if (conviction?.includes('STRONG')) return 'bg-emerald-100 text-emerald-600';
+  if (conviction?.includes('WATCH')) return 'bg-amber-100 text-amber-600';
+  if (conviction?.includes('INSUFFICIENT') || conviction?.includes('STALE')) return 'bg-gray-100 text-gray-500';
+  return 'bg-red-50 text-red-400';
+}
+
 // ─── ScoreCard — compact inline result ─────────────────────────────────────────────────────
 function ScoreCard({ result, onViewFull }) {
   const pct     = result.pct || 0;
-  const barCls  = pct >= 75 ? 'bg-emerald-500'  : pct >= 56 ? 'bg-amber-400'  : 'bg-red-400';
-  const textCls = pct >= 75 ? 'text-emerald-500' : pct >= 56 ? 'text-amber-500' : 'text-red-400';
-  const badgeCls = result.conviction?.includes('STRONG')
-    ? 'bg-emerald-100 text-emerald-600'
-    : result.conviction?.includes('WATCH') ? 'bg-amber-100 text-amber-600' : 'bg-red-50 text-red-400';
+  const barCls  = barColour(pct, result.conviction);
+  const textCls = pctColour(pct, result.conviction);
+  const badgeCls = badgeColour(result.conviction);
+  const lowCoverage = (result.coverage ?? 100) < 70;
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 mb-4">
@@ -292,11 +333,13 @@ function ScoreCard({ result, onViewFull }) {
         <div className={`${barCls} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
       </div>
 
+      {/* Multibagger headline — the numbers this screen actually exists to surface */}
       <div className="flex gap-2 mb-3">
         {[
-          ['Quant', `${result.quant_score} / ${result.quant_max}`],
-          ['AI Qual', `${result.qual_score} / ${result.qual_max}`],
-          ['Sector', result.sector || '—'],
+          ['Compounding', result.sgr != null ? `${result.sgr.toFixed(0)}%/yr` : '—'],
+          ['→ 10×', result.years_to_10x ? `~${result.years_to_10x} yrs` : '—'],
+          ['→ 100×', result.years_to_100x ? `~${result.years_to_100x} yrs` : '—'],
+          ['Coverage', `${(result.coverage ?? 0).toFixed(0)}%`],
         ].map(([label, val]) => (
           <div key={label} className="flex-1 bg-gray-50 rounded-lg px-2 py-2 text-center overflow-hidden">
             <div className="text-[9px] text-gray-400 uppercase tracking-wide">{label}</div>
@@ -304,6 +347,12 @@ function ScoreCard({ result, onViewFull }) {
           </div>
         ))}
       </div>
+
+      {lowCoverage && (
+        <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1.5 mb-3">
+          Only {(result.coverage ?? 0).toFixed(0)}% of the rubric had data behind it — score withheld.
+        </div>
+      )}
 
       {result.red_flags?.length > 0 && (
         <div className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5 mb-3">
@@ -327,52 +376,48 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
     return <div className="flex items-center justify-center h-48 text-gray-400 text-sm">No data</div>;
   }
 
+  // Order and labels mirror cloudflare/screener_engine.js RUBRIC.
   const CRITERIA_ORDER = [
-    // Tier 1 — Must-Haves (weight 3)
-    { id: 'roe',          label: 'ROE ≥ 20% avg',                weight: 3, tier: 1 },
-    { id: 'rev_growth',   label: 'Revenue CAGR ≥ 10%',           weight: 3, tier: 1 },
-    { id: 'gross_margin', label: 'Gross margin vs sector',        weight: 3, tier: 1 },
-    { id: 'moat',         label: 'Durable economic moat',         weight: 3, tier: 1 },
-    { id: 'insider_own',  label: 'Insider ownership ≥ 10%',      weight: 3, tier: 1 },
-    { id: 'runway',       label: 'TAM / reinvestment runway',     weight: 3, tier: 1 },
-    // Tier 2 — Important (weight 2)
-    { id: 'eps_growth',   label: 'EPS CAGR ≥ 10%',               weight: 2, tier: 2 },
-    { id: 'fcf',          label: 'FCF positive & growing',        weight: 2, tier: 2 },
-    { id: 'debt',         label: 'Net debt / EBITDA < 2×',       weight: 2, tier: 2 },
-    { id: 'mktcap',       label: 'Market cap $500M–$3B',          weight: 2, tier: 2 },
-    { id: 'cap_alloc',    label: 'Capital allocation quality',    weight: 2, tier: 2 },
-    { id: 'industry',     label: 'Stable, slow-changing sector',  weight: 2, tier: 2 },
-    // Tier 3 — Supporting (weight 1)
-    { id: 'shares',       label: 'Share count declining / flat',  weight: 1, tier: 3 },
-    { id: 'peg',          label: 'PEG ratio < 1.0',               weight: 1, tier: 3 },
-    { id: 'dividend',     label: 'Low / no dividend',             weight: 1, tier: 3 },
-    { id: 'insider_buy',  label: 'Insiders net buying (AI)',      weight: 1, tier: 3 },
-    { id: 'disclosure',   label: 'Clear management disclosures',  weight: 1, tier: 3 },
-    { id: 'roic',         label: 'ROIC ≥ 10% avg',                weight: 1, tier: 3 },
+    // Tier 1 — the compounding engine (weight 3)
+    { id: 'reinvestment',  label: 'Reinvestment engine (ROIC × retention)', weight: 3, tier: 1 },
+    { id: 'roic',          label: 'ROIC ≥ 20%',                             weight: 3, tier: 1 },
+    { id: 'rev_growth',    label: 'Revenue CAGR ≥ 20%',                     weight: 3, tier: 1 },
+    { id: 'runway',        label: 'TAM headroom / reinvestment runway',     weight: 3, tier: 1 },
+    { id: 'moat',          label: 'Durable moat (20yr+)',                   weight: 3, tier: 1 },
+    // Tier 2 — multibagger preconditions (weight 2)
+    { id: 'size_headroom', label: 'Size headroom (room to 10–100×)',        weight: 2, tier: 2 },
+    { id: 'insider_own',   label: 'Owner-operator (insiders ≥ 10%)',        weight: 2, tier: 2 },
+    { id: 'gross_margin',  label: 'Gross margin vs sector',                 weight: 2, tier: 2 },
+    { id: 'fcf',           label: 'FCF positive & growing',                 weight: 2, tier: 2 },
+    { id: 'debt',          label: 'Net debt / EBITDA < 1.5×',               weight: 2, tier: 2 },
+    { id: 'cap_alloc',     label: 'Capital allocation quality',             weight: 2, tier: 2 },
+    // Tier 3 — entry & hygiene (weight 1)
+    { id: 'peg',           label: 'PEG < 1 (entry multiple)',               weight: 1, tier: 3 },
+    { id: 'eps_growth',    label: 'EPS CAGR ≥ 15%',                         weight: 1, tier: 3 },
+    { id: 'shares',        label: 'No dilution',                            weight: 1, tier: 3 },
+    { id: 'industry',      label: 'Industry stability',                     weight: 1, tier: 3 },
+    { id: 'disclosure',    label: 'Management transparency',                weight: 1, tier: 3 },
+    { id: 'insider_buy',   label: 'Insiders net buying',                    weight: 1, tier: 3 },
   ];
 
-  const SCORE_SYM  = { 2: '✓', 1: '∼', 0: '✗' };
-  const SCORE_CLS  = { 2: 'text-emerald-500', 1: 'text-amber-500', 0: 'text-red-400' };
   const TIER_LABEL = {
-    1: 'Tier 1 — Must-Haves  (×3)',
-    2: 'Tier 2 — Important  (×2)',
-    3: 'Tier 3 — Supporting  (×1)',
+    1: 'Tier 1 — Compounding engine  (×3)',
+    2: 'Tier 2 — Multibagger preconditions  (×2)',
+    3: 'Tier 3 — Entry & hygiene  (×1)',
   };
 
   // Criteria come from fresh result (data.criteria) or DB load (data.score_data)
   const criteria = data.score_data || data.criteria || {};
   const pct      = parseFloat(data.pct) || 0;
   const total    = data.total_score ?? data.total ?? 0;
-  const max      = data.max_score   ?? data.max   ?? 72;
-  const qScore   = data.quant_score ?? 0;
-  const qMax     = data.quant_max   ?? 48;
-  const alScore  = data.qual_score  ?? 0;
-  const alMax    = data.qual_max    ?? 24;
-  const barCls   = pct >= 75 ? 'bg-emerald-500' : pct >= 56 ? 'bg-amber-400' : 'bg-red-400';
-  const textCls  = pct >= 75 ? 'text-emerald-500' : pct >= 56 ? 'text-amber-500' : 'text-red-400';
-  const badgeCls = data.conviction?.includes('STRONG')
-    ? 'bg-emerald-100 text-emerald-600'
-    : data.conviction?.includes('WATCH') ? 'bg-amber-100 text-amber-600' : 'bg-red-50 text-red-400';
+  const max      = data.max_score   ?? data.max   ?? 0;
+  const coverage = parseFloat(data.coverage_pct ?? data.coverage ?? 0);
+  const sgr      = data.sgr != null ? parseFloat(data.sgr) : null;
+  const y10      = data.years_to_10x ?? null;
+  const barCls   = barColour(pct, data.conviction);
+  const textCls  = pctColour(pct, data.conviction);
+  const badgeCls = badgeColour(data.conviction);
+  const sources  = data.sources || [];
 
   let lastTier = null;
 
@@ -405,11 +450,12 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
         </div>
 
         {/* Summary row */}
-        <div className="grid grid-cols-3 gap-2 mb-4">
+        <div className="grid grid-cols-4 gap-2 mb-4">
           {[
-            ['Quant',   `${qScore} / ${qMax}`],
-            ['AI Qual', `${alScore} / ${alMax}`],
-            ['Verdict', data.conviction || '—'],
+            ['Compounding', sgr != null ? `${sgr.toFixed(0)}%/yr` : '—'],
+            ['→ 10×',       y10 ? `~${y10} yrs` : '—'],
+            ['Coverage',    coverage ? `${coverage.toFixed(0)}%` : '—'],
+            ['Verdict',     data.conviction || '—'],
           ].map(([label, val]) => (
             <div key={label} className="bg-gray-50 rounded-lg px-2 py-2 text-center overflow-hidden">
               <div className="text-[9px] text-gray-400 uppercase tracking-wide">{label}</div>
@@ -432,6 +478,9 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
             if (!c) return null;
             const showTier = def.tier !== lastTier;
             lastTier = def.tier;
+            const scoreKey = (c.score === null || c.score === undefined) ? null : c.score;
+            const isNull   = scoreKey === null;
+            const srcKey   = c.source || 'none';
             return (
               <React.Fragment key={def.id}>
                 {showTier && (
@@ -439,20 +488,42 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
                     {TIER_LABEL[def.tier]}
                   </div>
                 )}
-                <div className="flex items-start gap-2 py-2 border-b border-gray-50 last:border-0">
-                  <span className={`${SCORE_CLS[c.score]} font-bold text-sm w-4 shrink-0 mt-px leading-tight`}>
-                    {SCORE_SYM[c.score]}
+                <div className={`flex items-start gap-2 py-2 border-b border-gray-50 last:border-0 ${isNull ? 'opacity-60' : ''}`}>
+                  <span className={`${SCORE_CLS[scoreKey]} font-bold text-sm w-4 shrink-0 mt-px leading-tight`}>
+                    {SCORE_SYM[scoreKey]}
                   </span>
                   <div className="flex-1 min-w-0">
-                    <div className="text-[11px] font-medium text-gray-700 leading-tight">{def.label}</div>
+                    <div className="text-[11px] font-medium text-gray-700 leading-tight flex items-center gap-1.5">
+                      {def.label}
+                      <span className={`text-[8px] px-1 py-px rounded uppercase tracking-wide ${SOURCE_CLS[srcKey] || SOURCE_CLS.none}`}>
+                        {SOURCE_LABEL[srcKey] || srcKey}
+                      </span>
+                    </div>
                     <div className="text-[10px] text-gray-400 leading-snug mt-0.5">{c.note}</div>
                   </div>
-                  <span className="text-[10px] text-gray-300 mono shrink-0">{c.score * def.weight}/{def.weight * 2}</span>
+                  <span className="text-[10px] text-gray-300 mono shrink-0">
+                    {isNull ? 'n/a' : `${c.score * def.weight}/${def.weight * 2}`}
+                  </span>
                 </div>
               </React.Fragment>
             );
           })}
         </div>
+
+        {/* Grounding citations — what the AI half actually read */}
+        {sources.length > 0 && (
+          <div className="pt-4">
+            <div className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pb-1.5">Sources</div>
+            <div className="flex flex-wrap gap-1">
+              {sources.map((s, i) => (
+                <a key={i} href={s} target="_blank" rel="noopener noreferrer"
+                   className="text-[9px] text-blue-500 hover:text-blue-700 bg-blue-50 rounded px-1.5 py-0.5 truncate max-w-[46%]">
+                  {(() => { try { return new URL(s).hostname.replace(/^www\./, ''); } catch { return s; } })()}
+                </a>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="pt-4 text-[10px] text-gray-300 text-center">
           Scored {data.scored_at} · {data.sector} · {data.industry}
