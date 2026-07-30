@@ -5,6 +5,8 @@
 //       0/1/2/null scoring with a dynamic denominator, multibagger rubric.
 //       Scoring logic now lives in screener_{engine,data,score,cache}.js.
 // v12 – screener upstreams cached; ?refresh=1 bypasses every layer.
+// v13 – screener: verify the token before scoring, and report whether the
+//       result actually persisted instead of swallowing the failure.
 import { scoreTicker } from './screener_score.js';
 
 export default {
@@ -178,23 +180,56 @@ export default {
     if (scoreTickerSym) {
       const authHeader = request.headers.get('Authorization') || '';
       if (!authHeader.startsWith('Bearer ')) {
-        return new Response(JSON.stringify({ error: 'Authentication required' }), {
+        return new Response(JSON.stringify({ error: 'Authentication required', code: 'no_token' }), {
           status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders },
         });
       }
+
+      // Verify the token BEFORE doing ~30s of work. `startsWith('Bearer ')` is
+      // not authentication — it accepts any string. auth.php rotates api_token
+      // on every login, so a token left in localStorage after signing in
+      // elsewhere is stale, and used to buy a full grounded-search score that
+      // could never be saved.
+      //
+      // Fails OPEN on a network error: a labanos.dk hiccup shouldn't block
+      // scoring, and the persist result below reports the truth regardless.
+      try {
+        const verify = await fetch('https://labanos.dk/auth.php', {
+          headers: { 'Authorization': authHeader },
+        });
+        if (verify.status === 401) {
+          return new Response(JSON.stringify({
+            error: 'Session expired — please sign in again',
+            code: 'token_invalid',
+          }), { status: 401, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+      } catch (_) { /* unreachable — fall through and score */ }
+
       const symbol = scoreTickerSym.toUpperCase().trim();
       const refresh = url.searchParams.get('refresh') === '1';
       try {
         const scoreResult = await scoreTicker(symbol, env, refresh);
 
-        // Persist to DB (non-fatal)
+        // Persist. A 401/500 here is a RESOLVED fetch, not an exception, so the
+        // old `try { await fetch(...) } catch {}` never saw it and every failed
+        // save vanished silently. Check the status and report it.
+        let persisted = false, persistStatus = null, persistError = null;
         try {
-          await fetch('https://labanos.dk/screener.php', {
+          const saveRes = await fetch('https://labanos.dk/screener.php', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
             body: JSON.stringify(scoreResult),
           });
-        } catch (_) {}
+          persistStatus = saveRes.status;
+          persisted = saveRes.ok;
+          if (!persisted) persistError = (await saveRes.text().catch(() => '')).slice(0, 200);
+        } catch (e) {
+          persistError = String(e.message);
+        }
+
+        scoreResult.persisted = persisted;
+        scoreResult.persist_status = persistStatus;
+        if (persistError) scoreResult.persist_error = persistError;
 
         return new Response(JSON.stringify(scoreResult), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
       } catch (e) {
