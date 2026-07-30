@@ -19,6 +19,11 @@
 //     (the sustainable growth rate) is a first-class Tier 1 criterion, and
 //     market cap is scored as *headroom to 10–100×* rather than a fixed band.
 //
+//  5. That engine is earnings-based, which cannot see a company reinvesting
+//     hard at negative accounting earnings — Amazon would have scored 0 on
+//     Tier 1 for most of its best two decades. So ROIC accepts a CASH basis
+//     (see screener_data.js) and is labelled when it uses one.
+//
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── Rubric ──────────────────────────────────────────────────────────────────
@@ -96,9 +101,13 @@ export function scoreSizeHeadroom(mcapUsd) {
  * This is the single most important number in the model. A company can only
  * compound intrinsic value as fast as it can redeploy capital at its return
  * on capital. Coca-Cola earns a fine ROIC but pays most of it out, so its
- * engine runs at ~4-5%/yr. NVIDIA retains essentially everything at a far
+ * engine runs at ~6%/yr. NVIDIA retains essentially everything at a far
  * higher ROIC. That difference is exactly why one can still multibag and the
  * other cannot, and it falls out of the arithmetic rather than an AI opinion.
+ *
+ * `roic` may be earnings- or cash-based; see screener_data.js. The basis is
+ * carried separately and surfaced in the notes, because an unproven engine
+ * must never be presented as a proven one.
  */
 export function sustainableGrowth(roic, payoutRatio) {
   const r = num(roic), p = num(payoutRatio);
@@ -112,6 +121,32 @@ export function yearsToMultiple(rate, multiple = 10) {
   const r = num(rate);
   if (r === null || r <= 0) return null;
   return Math.log(multiple) / Math.log(1 + r);
+}
+
+/**
+ * Band a free-cash-flow series.
+ *
+ * The inflection case is deliberately scored as highly as a long positive
+ * run. A company crossing from cash-burning to strongly cash-generative
+ * while growing is the single most interesting shape a multibagger screen
+ * can find — Cloudflare went -28M → 287M and the old rule scored it 1, the
+ * same as a business that had been flatly, boringly positive for five years.
+ *
+ * Requires the last TWO points positive so a single good year doesn't count
+ * as an inflection.
+ */
+export function scoreFcf(series) {
+  if (!Array.isArray(series) || series.length < 2) return { score: null, inflected: false };
+  const first = series[0], last = series[series.length - 1];
+  const prev = series[series.length - 2];
+  const allPos = series.every(v => v > 0);
+  const growing = last > first;
+  const inflected = first <= 0 && last > 0 && prev > 0 && growing;
+
+  if (inflected) return { score: 2, inflected: true };
+  if (allPos && growing) return { score: 2, inflected: false };
+  if (last > 0) return { score: 1, inflected: false };
+  return { score: 0, inflected: false };
 }
 
 // ─── Computed criteria ───────────────────────────────────────────────────────
@@ -138,17 +173,26 @@ export function computeQuantCriteria(m) {
   // ── Tier 1 ──
   const roic = val('roic');
   const payout = val('payout_ratio');
+  const cashBasis = m.roic?.basis === 'fcf';
+  const roicLabel = cashBasis ? 'cash ROIC' : 'ROIC';
   const sgr = sustainableGrowth(roic, payout);
   const y10 = yearsToMultiple(sgr, 10);
+
   put('reinvestment', band(sgr, 0.20, 0.10),
     sgr === null
       ? 'ROIC unavailable — cannot compute reinvestment rate'
-      : `SGR ${pct(sgr)} = ROIC ${pct(roic)} × retention ${pct(1 - (payout ?? 0))}` +
-        (y10 ? ` → ~${y10.toFixed(0)}yr to 10×` : ''),
+      : `SGR ${pct(sgr)} = ${roicLabel} ${pct(roic)} × retention ${pct(1 - (payout ?? 0))}` +
+        (y10 ? ` → ~${y10.toFixed(0)}yr to 10×` : '') +
+        (cashBasis ? ' · cash basis, accounting earnings still negative' : ''),
     src('roic'));
 
   put('roic', band(roic, 0.20, 0.12),
-    roic === null ? 'No ROIC data' : `ROIC ${pct(roic)} (3yr avg)`, src('roic'));
+    roic === null
+      ? 'No ROIC data'
+      : cashBasis
+        ? `Cash ROIC ${pct(roic)} (FCF ÷ invested capital) — earnings basis is negative`
+        : `ROIC ${pct(roic)} (3yr avg)`,
+    src('roic'));
 
   const rg = val('rev_cagr');
   put('rev_growth', band(rg, 0.20, 0.10),
@@ -156,8 +200,7 @@ export function computeQuantCriteria(m) {
 
   // ── Tier 2 ──
   const mcap = val('mktcap_usd');
-  const shScore = scoreSizeHeadroom(mcap);
-  put('size_headroom', shScore,
+  put('size_headroom', scoreSizeHeadroom(mcap),
     mcap === null
       ? 'No market cap'
       : `$${(mcap / 1e9).toFixed(1)}B — 10× ⇒ $${(mcap * 10 / 1e12).toFixed(2)}T, ` +
@@ -178,15 +221,13 @@ export function computeQuantCriteria(m) {
     src('gross_margin'));
 
   const fcfSeries = m.fcf_series?.value;
-  let fcfScore = null, fcfNote = 'No cash-flow data';
+  const fcfBand = scoreFcf(fcfSeries);
+  let fcfNote = 'No cash-flow data';
   if (Array.isArray(fcfSeries) && fcfSeries.length >= 2) {
-    const last = fcfSeries[fcfSeries.length - 1];
-    const allPos = fcfSeries.every(v => v > 0);
-    const growing = last > fcfSeries[0];
-    fcfScore = (allPos && growing) ? 2 : last > 0 ? 1 : 0;
-    fcfNote = `FCF ${fcfSeries.map(v => (v / 1e6).toFixed(0) + 'M').join(' → ')}`;
+    fcfNote = `FCF ${fcfSeries.map(v => (v / 1e6).toFixed(0) + 'M').join(' → ')}` +
+              (fcfBand.inflected ? ' · inflected positive' : '');
   }
-  put('fcf', fcfScore, fcfNote, src('fcf_series'));
+  put('fcf', fcfBand.score, fcfNote, src('fcf_series'));
 
   const nd = val('net_debt_ebitda');
   let debtScore = null;
@@ -276,6 +317,8 @@ export function redFlags(criteria, metrics) {
   if (s('debt') === 0) f.push('Net debt > 3× EBITDA');
   if (s('moat') === 0) f.push('No identifiable moat');
   if (s('shares') === 0) f.push('Shareholders being diluted');
+  // A cash-basis engine is a candidate, not a track record. Say so.
+  if (metrics?.roicBasis === 'fcf') f.push('Engine unproven — cash basis, earnings still negative');
   const y10 = yearsToMultiple(num(metrics?.sgr), 10);
   if (y10 && y10 > 30) f.push(`~${y10.toFixed(0)}yr to 10× at current SGR`);
   return f;
