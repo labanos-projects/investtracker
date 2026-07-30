@@ -128,6 +128,7 @@ export async function scoreTicker(symbol, env, refresh = false) {
 
   const agg = aggregate(criteria);
   const sgr = sustainableGrowth(metrics.roic?.value, metrics.payout_ratio?.value);
+  const roicBasis = metrics.roic?.basis || 'earnings';
 
   // yearsToMultiple returns null for a non-positive rate. Guard on the RESULT:
   // a negative SGR is truthy, so `sgr ? Math.round(...) : null` rounded null
@@ -142,11 +143,14 @@ export async function scoreTicker(symbol, env, refresh = false) {
     industry: metrics._meta?.industry || parsed.industry || '',
     criteria,
     ...agg,
-    red_flags: redFlags(criteria, { sgr }),
+    // roicBasis drives an explicit "engine unproven" flag — a cash-basis score
+    // is a candidate for a closer look, not a track record.
+    red_flags: redFlags(criteria, { sgr, roicBasis }),
     // Headline multibagger metrics — the numbers you actually want on the card.
     sgr: sgr === null ? null : Math.round(sgr * 1000) / 10,
     years_to_10x: y10 === null ? null : Math.round(y10),
     years_to_100x: y100 === null ? null : Math.round(y100),
+    roic_basis: roicBasis,
     mktcap_usd: metrics.mktcap_usd?.value ?? null,
     sources: ai?.sources || [],
     diagnostics: {
