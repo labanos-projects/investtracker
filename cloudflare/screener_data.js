@@ -20,26 +20,26 @@
 //     fundamentals-timeseries endpoint, never from quoteSummary.
 //
 //  2. Series are keyed by period END year and aligned on it. See edgarFacts
-//     for the two XBRL traps this cost us.
+//     for the two XBRL traps this cost us (report-year vs period-year, and
+//     stock splits corrupting share counts across filings).
 //
 //  3. CIK resolution falls back to company-name matching. "NOVO-B.CO" reduces
 //     to "NOVO" but Novo Nordisk's ADR is "NVO", so the ticker-root lookup
 //     missed it and the whole 20-F/IFRS path went unused.
+//
+//  4. Every upstream goes through screener_cache.js. ?refresh=1 bypasses it.
 // ─────────────────────────────────────────────────────────────────────────────
+
+import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
 
 const UA = 'InvestTracker/1.0 (labanos@gmail.com)';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const timeout = (p, ms) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error('timeout')), ms))]);
-const j = async (url, opts = {}, ms = 8000) => {
-  const res = await timeout(fetch(url, opts), ms);
-  if (!res.ok) throw new Error(`${res.status} ${url.slice(0, 60)}`);
-  return res.json();
-};
 
 // ─── Year-keyed series helpers ───────────────────────────────────────────────
 // A "series" is a Map<periodEndYear, value>. Aligning on the key rather than
-// the index is the whole point.
+// the index is the whole point — see fix (2) above.
 
 const lastN = (map, n = 5) => {
   if (!map || !map.size) return [];
@@ -67,14 +67,14 @@ const cagrOf = s => {
   if (f.length < 2 || f[0] <= 0 || f[f.length - 1] <= 0) return null;
   return Math.pow(f[f.length - 1] / f[0], 1 / (f.length - 1)) - 1;
 };
-const avg = a => (a && a.length) ? a.reduce((x, y) => x + y, 0) / a.length : null;
 
 // ─── FX (Frankfurter — ECB, no key) ──────────────────────────────────────────
-export async function fxToUsd(ccy) {
+export async function fxToUsd(ccy, refresh = false) {
   if (!ccy || ccy === 'USD') return 1;
   const base = ccy === 'GBp' ? 'GBP' : ccy;   // Yahoo quotes UK stocks in pence
   try {
-    const d = await j(`https://api.frankfurter.dev/v1/latest?base=${base}&symbols=USD`, {}, 6000);
+    const d = await cachedJson(`https://api.frankfurter.dev/v1/latest?base=${base}&symbols=USD`, {},
+      { ttl: TTL.FX, ms: 6000, refresh, key: `fx:${base}` });
     const rate = d?.rates?.USD;
     if (!rate) return null;
     return ccy === 'GBp' ? rate / 100 : rate;
@@ -83,7 +83,7 @@ export async function fxToUsd(ccy) {
 
 // ─── Yahoo cookie + crumb handshake ──────────────────────────────────────────
 // Confirmed working from the Worker across all 9 tickers, which contradicts the
-// CLAUDE.md gotcha. Keep an eye on it — it's undocumented.
+// old CLAUDE.md gotcha. Keep an eye on it — it's undocumented.
 let _crumb = null, _cookie = null, _crumbAt = 0;
 
 export async function yahooCrumb() {
@@ -108,11 +108,13 @@ const YF_MODULES = [
   'majorHoldersBreakdown', 'assetProfile',
 ].join(',');
 
-export async function yahooSummary(symbol) {
+export async function yahooSummary(symbol, refresh = false) {
   const { crumb, cookie } = await yahooCrumb();
   const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}` +
               `?modules=${YF_MODULES}&crumb=${encodeURIComponent(crumb)}`;
-  const d = await j(url, { headers: { 'User-Agent': BROWSER_UA, 'Cookie': cookie } }, 10000);
+  // The crumb rotates, so it must not be part of the cache key.
+  const d = await cachedJson(url, { headers: { 'User-Agent': BROWSER_UA, 'Cookie': cookie } },
+    { ttl: TTL.YF_SUMMARY, ms: 10000, refresh, key: `yf-summary:${symbol}` });
   const r = d?.quoteSummary?.result?.[0];
   if (!r) throw new Error('no quoteSummary result');
   const raw = v => (v && typeof v === 'object' && 'raw' in v) ? v.raw : (typeof v === 'number' ? v : null);
@@ -143,13 +145,15 @@ const TS_FIELDS = [
   'annualOperatingCashFlow', 'annualCapitalExpenditure', 'annualFreeCashFlow',
 ];
 
-export async function yahooTimeseries(symbol) {
+export async function yahooTimeseries(symbol, refresh = false) {
   const { crumb, cookie } = await yahooCrumb();
   const now = Math.floor(Date.now() / 1000);
   const url = `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(symbol)}` +
               `?symbol=${encodeURIComponent(symbol)}&type=${TS_FIELDS.join(',')}` +
               `&period1=0&period2=${now}&crumb=${encodeURIComponent(crumb)}`;
-  const d = await j(url, { headers: { 'User-Agent': BROWSER_UA, 'Cookie': cookie } }, 12000);
+  // period2 is "now" and the crumb rotates — neither belongs in the cache key.
+  const d = await cachedJson(url, { headers: { 'User-Agent': BROWSER_UA, 'Cookie': cookie } },
+    { ttl: TTL.YF_TIMESERIES, ms: 12000, refresh, key: `yf-ts:${symbol}` });
   const results = d?.timeseries?.result || [];
 
   const out = {};
@@ -173,10 +177,11 @@ const normName = s => String(s || '').toUpperCase()
   .replace(/\b(INC|CORP|CORPORATION|COMPANY|CO|LTD|PLC|A\/S|AB|NV|SA|SE|AG|HOLDINGS?|GROUP|THE)\b/g, '')
   .replace(/[^A-Z0-9]/g, '');
 
-async function loadSecMaps() {
-  if (_tickerMap) return;
-  const d = await j('https://www.sec.gov/files/company_tickers_exchange.json',
-    { headers: { 'User-Agent': UA } }, 12000);
+async function loadSecMaps(refresh = false) {
+  if (_tickerMap && !refresh) return;
+  const d = await cachedJson('https://www.sec.gov/files/company_tickers_exchange.json',
+    { headers: { 'User-Agent': UA } },
+    { ttl: TTL.SEC_MAP, ms: 12000, refresh, key: 'sec:ticker-map' });
   const iT = d.fields.indexOf('ticker'), iC = d.fields.indexOf('cik'), iN = d.fields.indexOf('name');
   _tickerMap = {}; _nameMap = {};
   for (const row of d.data) {
@@ -190,10 +195,11 @@ async function loadSecMaps() {
  * Resolve a CIK. Exact ticker first, then ticker root, then company name.
  *
  * The name fallback is what makes European 20-F filers reachable: "NOVO-B.CO"
- * roots to "NOVO", but Novo Nordisk lists in the US as "NVO".
+ * roots to "NOVO", but Novo Nordisk lists in the US as "NVO". Matching on
+ * "NOVONORDISK" finds CIK 353278 and unlocks the IFRS branch.
  */
-export async function secCik(symbol, companyName) {
-  await loadSecMaps();
+export async function secCik(symbol, companyName, refresh = false) {
+  await loadSecMaps(refresh);
   const up = symbol.toUpperCase();
   if (_tickerMap[up]) return _tickerMap[up];
   const root = up.replace(/[-.].*$/, '');
@@ -233,6 +239,8 @@ const TAGS = {
     ['us-gaap', 'WeightedAverageNumberOfSharesOutstandingBasic'],
     ['ifrs-full', 'WeightedAverageNumberOfDilutedSharesOutstanding'],
   ],
+  // Cash flow — absent in v1, which is why FCF was null for every ticker even
+  // where EDGAR answered fine.
   cfo: [
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivities'],
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
@@ -245,10 +253,12 @@ const TAGS = {
   ],
 };
 
-export async function edgarFacts(cik) {
+export async function edgarFacts(cik, refresh = false) {
   const padded = String(cik).padStart(10, '0');
-  const d = await j(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,
-    { headers: { 'User-Agent': UA } }, 15000);
+  // The slowest call in the chain — multi-MB, and changes four times a year.
+  const d = await cachedJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,
+    { headers: { 'User-Agent': UA } },
+    { ttl: TTL.EDGAR, ms: 15000, refresh, key: `edgar:${padded}` });
 
   /**
    * @param {boolean} singleFiling  Restrict to the most recent accession.
@@ -310,7 +320,7 @@ export async function edgarFacts(cik) {
 
 // ─── Merge into a metrics bag with provenance ────────────────────────────────
 
-export async function resolveMetrics(symbol, env) {
+export async function resolveMetrics(symbol, env, refresh = false) {
   const m = {};
   const set = (k, v, source) => {
     if (v === null || v === undefined || (typeof v === 'number' && !isFinite(v))) return;
@@ -318,14 +328,14 @@ export async function resolveMetrics(symbol, env) {
     m[k] = { value: v, source };
   };
 
-  const summary = await yahooSummary(symbol).catch(e => ({ _err: String(e.message) }));
+  const summary = await yahooSummary(symbol, refresh).catch(e => ({ _err: String(e.message) }));
   const ok = summary && !summary._err;
 
   // Name-based CIK resolution needs the company name, so this runs after summary.
-  const cik = await secCik(symbol, ok ? summary.longName : null).catch(() => null);
+  const cik = await secCik(symbol, ok ? summary.longName : null, refresh).catch(() => null);
   const [edgar, ts] = await Promise.all([
-    cik ? edgarFacts(cik).catch(() => null) : Promise.resolve(null),
-    yahooTimeseries(symbol).catch(() => null),
+    cik ? edgarFacts(cik, refresh).catch(() => null) : Promise.resolve(null),
+    yahooTimeseries(symbol, refresh).catch(() => null),
   ]);
 
   // ── EDGAR first for anything audited ──
@@ -387,7 +397,7 @@ export async function resolveMetrics(symbol, env) {
       set('net_debt_ebitda', netDebt / summary.ebitda, 'yahoo');
     }
     if (summary.mktcap_native) {
-      const fx = await fxToUsd(summary.currency);
+      const fx = await fxToUsd(summary.currency, refresh);
       if (fx) set('mktcap_usd', summary.mktcap_native * fx, `yahoo+fx(${summary.currency})`);
     }
     m._meta = { currency: summary.currency, sector: summary.sector, industry: summary.industry, price: summary.price };
@@ -397,7 +407,11 @@ export async function resolveMetrics(symbol, env) {
   if (env?.FMP_API_KEY && !m.roic) {
     try {
       const fmpSym = symbol.replace(/\.[A-Z]{1,3}$/, '');
-      const km = await j(`https://financialmodelingprep.com/stable/key-metrics-ttm?symbol=${fmpSym}&apikey=${env.FMP_API_KEY}`, {}, 8000);
+      // Cached hardest of all — this is the only metered upstream (250/day),
+      // and the api key must stay out of the cache key.
+      const km = await cachedJson(
+        `https://financialmodelingprep.com/stable/key-metrics-ttm?symbol=${fmpSym}&apikey=${env.FMP_API_KEY}`,
+        {}, { ttl: TTL.EDGAR, ms: 8000, refresh, key: `fmp:key-metrics:${fmpSym}` });
       const k = Array.isArray(km) ? km[0] : null;
       if (k) {
         set('roic', k.returnOnInvestedCapitalTTM, 'fmp');
@@ -415,6 +429,8 @@ export async function resolveMetrics(symbol, env) {
     ts_fields: ts ? Object.keys(ts) : [],
     fcf_source: m.fcf_series?.source || null,
     eps_source: m.eps_cagr?.source || null,
+    refresh,
+    cache: statsSnapshot(),
   };
   return m;
 }
