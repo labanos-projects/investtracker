@@ -1,12 +1,13 @@
 // ─── screener_score.js — orchestrator ────────────────────────────────────────
 // Computed criteria come from filings; only the six genuinely qualitative ones
-// go to Gemini, and those are now search-grounded rather than recalled from
+// go to Gemini, and those are search-grounded rather than recalled from
 // training data (which is what put Adobe's P/E at a 2023-era 46.5 and produced
 // a PEG above 2 when the real figure is comfortably under 1).
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { RUBRIC, computeQuantCriteria, aggregate, redFlags, sustainableGrowth, yearsToMultiple } from './screener_engine.js';
 import { resolveMetrics } from './screener_data.js';
+import { cachedValue, TTL, resetStats, statsSnapshot } from './screener_cache.js';
 
 const MODEL = 'gemini-2.5-flash';
 // google_search grounding and responseSchema are mutually exclusive on 2.5
@@ -43,23 +44,33 @@ async function gemini(env, body) {
   };
 }
 
-/** Grounded research pass → prose + citations. */
-async function research(symbol, env) {
-  const { text, sources } = await gemini(env, {
-    contents: [{ parts: [{ text:
-      `Research the company with ticker ${symbol} using current sources. Today is ${new Date().toISOString().slice(0, 10)}.\n\n` +
-      `Report concisely on each of these, citing recent facts:\n${RUBRIC_TEXT}\n\n` +
-      `Also state the company's full name, GICS sector and industry. ` +
-      `Be specific about how much of its addressable market the company has already captured — ` +
-      `a dominant share of a mature market is a LOW score on runway even for an excellent business.`
-    }] }],
-    tools: [{ google_search: {} }],
-    generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
+/**
+ * Grounded research pass → prose + citations.
+ *
+ * Cached for 24h keyed on ticker + date. This is the expensive half (a live
+ * web search plus a long generation) and qualitative judgements about moats
+ * and TAM do not move day to day. The structuring pass below is deliberately
+ * NOT cached, so edits to the rubric take effect on the next score.
+ */
+async function research(symbol, env, refresh) {
+  const day = new Date().toISOString().slice(0, 10);
+  return cachedValue(`ai-research:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
+    const { text, sources } = await gemini(env, {
+      contents: [{ parts: [{ text:
+        `Research the company with ticker ${symbol} using current sources. Today is ${day}.\n\n` +
+        `Report concisely on each of these, citing recent facts:\n${RUBRIC_TEXT}\n\n` +
+        `Also state the company's full name, GICS sector and industry. ` +
+        `Be specific about how much of its addressable market the company has already captured — ` +
+        `a dominant share of a mature market is a LOW score on runway even for an excellent business.`
+      }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
+    });
+    return { notes: text, sources };
   });
-  return { notes: text, sources };
 }
 
-/** Ungrounded structuring pass → strict JSON. */
+/** Ungrounded structuring pass → strict JSON. Not cached. */
 async function structure(symbol, notes, env) {
   const props = { company: { type: 'STRING' }, sector: { type: 'STRING' }, industry: { type: 'STRING' } };
   for (const id of AI_IDS) {
@@ -85,12 +96,15 @@ async function structure(symbol, notes, env) {
   return JSON.parse(text);
 }
 
-export async function scoreTicker(symbol, env) {
+export async function scoreTicker(symbol, env, refresh = false) {
+  resetStats();
+  const t0 = Date.now();
+
   // Data and AI are independent — run them concurrently.
   const [metrics, ai] = await Promise.all([
-    resolveMetrics(symbol, env).catch(e => ({ _diag: { fatal: String(e.message) } })),
+    resolveMetrics(symbol, env, refresh).catch(e => ({ _diag: { fatal: String(e.message) } })),
     (async () => {
-      const { notes, sources } = await research(symbol, env);
+      const { notes, sources } = await research(symbol, env, refresh);
       const parsed = await structure(symbol, notes, env);
       return { parsed, sources };
     })().catch(e => ({ _err: String(e.message) })),
@@ -135,7 +149,11 @@ export async function scoreTicker(symbol, env) {
     years_to_100x: y100 === null ? null : Math.round(y100),
     mktcap_usd: metrics.mktcap_usd?.value ?? null,
     sources: ai?.sources || [],
-    diagnostics: metrics._diag || {},
+    diagnostics: {
+      ...(metrics._diag || {}),
+      elapsed_ms: Date.now() - t0,
+      cache: statsSnapshot(),
+    },
     scored_at: new Date().toISOString().split('T')[0],
   };
 }
