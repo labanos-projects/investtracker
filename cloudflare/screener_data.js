@@ -28,6 +28,9 @@
 //     missed it and the whole 20-F/IFRS path went unused.
 //
 //  4. Every upstream goes through screener_cache.js. ?refresh=1 bypasses it.
+//
+//  5. ROIC accepts a CASH basis when the earnings engine is unproven — see
+//     the cash-ROIC block in resolveMetrics.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
@@ -357,7 +360,11 @@ export async function resolveMetrics(symbol, env, refresh = false) {
       const y = yrs[yrs.length - 1];
       if (y != null) {
         const eq = edgar.equity.get(y), debt = ok ? (summary.total_debt || 0) : 0;
-        if (eq + debt > 0) set('roic', edgar.net_income.get(y) / (eq + debt), debt ? 'edgar+yahoo' : 'edgar');
+        if (eq + debt > 0) {
+          const icSrc = debt ? 'edgar+yahoo' : 'edgar';
+          m._ic = { value: eq + debt, source: icSrc };   // reused by the cash-ROIC fallback
+          set('roic', edgar.net_income.get(y) / (eq + debt), icSrc);
+        }
       }
     }
   }
@@ -381,7 +388,47 @@ export async function resolveMetrics(symbol, env, refresh = false) {
       const y = yrs[yrs.length - 1];
       if (y != null) {
         const eq = ts.stockholdersEquity.get(y), debt = ok ? (summary.total_debt || 0) : 0;
-        if (eq + debt > 0) set('roic', ts.netIncome.get(y) / (eq + debt), 'yahoo-ts');
+        if (eq + debt > 0) {
+          if (!m._ic) m._ic = { value: eq + debt, source: 'yahoo-ts' };
+          set('roic', ts.netIncome.get(y) / (eq + debt), 'yahoo-ts');
+        }
+      }
+    }
+  }
+
+  // ── Cash-basis ROIC for pre-profitability compounders ──────────────────────
+  //
+  // The engine (SGR = ROIC × retention) is earnings-based, so a company
+  // reinvesting hard at negative accounting earnings reads as a DEAD engine.
+  // Amazon would have scored 0 on Tier 1 for most of its best two decades;
+  // Cloudflare scored 0 while its FCF went -28M → +287M.
+  //
+  // The gates below are deliberately strict, because a DYING business also
+  // throws off cash — by cutting capex and liquidating working capital.
+  // Requiring real revenue growth is what separates "reinvesting for growth"
+  // from "harvesting a melting ice cube", and is precisely why GME (revenue
+  // flat-to-declining) does not qualify no matter how much net cash it holds.
+  {
+    const earningsRoic = m.roic?.value ?? null;
+    const fcf = m.fcf_series?.value;
+    const revG = m.rev_cagr?.value ?? null;
+    const ic = m._ic?.value ?? null;
+
+    const engineUnproven = earningsRoic === null || earningsRoic <= 0;
+    const haveSeries = Array.isArray(fcf) && fcf.length >= 3;
+    const growingRevenue = revG !== null && revG > 0.10;
+
+    if (engineUnproven && haveSeries && growingRevenue && ic > 0) {
+      const last = fcf[fcf.length - 1], prev = fcf[fcf.length - 2];
+      // Last TWO years positive, and improving overall — one good year is not
+      // an inflection.
+      if (last > 0 && prev > 0 && last > fcf[0]) {
+        m.roic = {
+          value: last / ic,
+          source: `${m._ic.source}/fcf`,
+          basis: 'fcf',
+          earnings_roic: earningsRoic,
+        };
       }
     }
   }
@@ -429,6 +476,8 @@ export async function resolveMetrics(symbol, env, refresh = false) {
     ts_fields: ts ? Object.keys(ts) : [],
     fcf_source: m.fcf_series?.source || null,
     eps_source: m.eps_cagr?.source || null,
+    roic_basis: m.roic?.basis || 'earnings',
+    roic_earnings: m.roic?.earnings_roic ?? null,
     refresh,
     cache: statsSnapshot(),
   };
