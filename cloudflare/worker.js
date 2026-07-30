@@ -3,7 +3,8 @@
 // v10 – Gemini scores all 18 criteria (YF blocks fundamental data from CF Workers)
 // v11 – screener rework: computed fundamentals (EDGAR/Yahoo/FMP) + grounded AI,
 //       0/1/2/null scoring with a dynamic denominator, multibagger rubric.
-//       Scoring logic now lives in screener_{engine,data,score}.js.
+//       Scoring logic now lives in screener_{engine,data,score,cache}.js.
+// v12 – screener upstreams cached; ?refresh=1 bypasses every layer.
 import { scoreTicker } from './screener_score.js';
 
 export default {
@@ -170,6 +171,9 @@ export default {
     // from filings (EDGAR → Yahoo → FMP, per field); only the six qualitative
     // criteria go to Gemini, search-grounded. Missing data scores null and is
     // excluded from the denominator rather than defaulting to a passing 1.
+    //
+    // ?refresh=1 bypasses every cache layer. Keep it — a cached score would
+    // have hidden the XBRL stock-split bug instead of surfacing it.
     const scoreTickerSym = url.searchParams.get('score_ticker');
     if (scoreTickerSym) {
       const authHeader = request.headers.get('Authorization') || '';
@@ -179,8 +183,9 @@ export default {
         });
       }
       const symbol = scoreTickerSym.toUpperCase().trim();
+      const refresh = url.searchParams.get('refresh') === '1';
       try {
-        const scoreResult = await scoreTicker(symbol, env);
+        const scoreResult = await scoreTicker(symbol, env, refresh);
 
         // Persist to DB (non-fatal)
         try {
