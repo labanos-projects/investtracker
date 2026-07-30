@@ -48,20 +48,27 @@ if ($method === 'GET') {
             $row['red_flags']   = json_decode($row['red_flags'] ?? '[]', true);
             $row['sources']     = json_decode($row['sources'] ?? '[]', true);
             $row['diagnostics'] = json_decode($row['diagnostics'] ?? '{}', true);
+            // Convenience mirror so the card doesn't have to dig into diagnostics.
+            $row['roic_basis']  = $row['diagnostics']['roic_basis'] ?? 'earnings';
         }
         echo json_encode($row ?: null);
     } else {
+        // roic_basis is derived from the diagnostics JSON rather than stored in
+        // its own column — it's already persisted there and we don't index on
+        // it, so a column would be schema churn for no gain.
         $stmt = $pdo->query(
             "SELECT ticker, company, sector, industry,
                     quant_score, quant_max, qual_score, qual_max,
                     total_score, max_score, pct, coverage_pct,
                     sgr, years_to_10x, years_to_100x, mktcap_usd,
-                    conviction, red_flags, scored_at
+                    conviction, red_flags, scored_at,
+                    JSON_UNQUOTE(JSON_EXTRACT(diagnostics, '$.roic_basis')) AS roic_basis
              FROM screener_results ORDER BY pct DESC, scored_at DESC"
         );
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
         foreach ($rows as &$r) {
-            $r['red_flags'] = json_decode($r['red_flags'] ?? '[]', true);
+            $r['red_flags']  = json_decode($r['red_flags'] ?? '[]', true);
+            $r['roic_basis'] = $r['roic_basis'] ?: 'earnings';
         }
         echo json_encode($rows);
     }
