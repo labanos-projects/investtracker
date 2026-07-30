@@ -11,7 +11,7 @@
 //   Frankfurter— no key, ECB rates
 //   FMP        — 250 req/day free tier, endpoint coverage is partial
 //
-// ── v2 fixes, after the first live run returned fcf=null on all 9 tickers ──
+// ── Fixes, each found by testing against production ──
 //
 //  1. Yahoo's quoteSummary statement modules (incomeStatementHistory,
 //     balanceSheetHistory, cashflowStatementHistory) come back EMPTY. The
@@ -29,8 +29,10 @@
 //
 //  4. Every upstream goes through screener_cache.js. ?refresh=1 bypasses it.
 //
-//  5. ROIC accepts a CASH basis when the earnings engine is unproven — see
-//     the cash-ROIC block in resolveMetrics.
+//  5. ROIC accepts a CASH basis when the earnings engine is unproven.
+//
+//  6. Debt is never defaulted to zero — see the invested-capital block. A
+//     missing Yahoo field used to collapse invested capital to equity-only.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
@@ -146,6 +148,7 @@ const TS_FIELDS = [
   'annualTotalRevenue', 'annualNetIncome', 'annualGrossProfit',
   'annualStockholdersEquity', 'annualDilutedAverageShares',
   'annualOperatingCashFlow', 'annualCapitalExpenditure', 'annualFreeCashFlow',
+  'annualTotalDebt',
 ];
 
 export async function yahooTimeseries(symbol, refresh = false) {
@@ -170,7 +173,7 @@ export async function yahooTimeseries(symbol, refresh = false) {
     }
     if (map.size) out[key.replace(/^annual/, '').replace(/^./, c => c.toLowerCase())] = map;
   }
-  return out; // { totalRevenue: Map, netIncome: Map, freeCashFlow: Map, ... }
+  return out; // { totalRevenue: Map, netIncome: Map, freeCashFlow: Map, totalDebt: Map, ... }
 }
 
 // ─── SEC EDGAR ───────────────────────────────────────────────────────────────
@@ -242,8 +245,8 @@ const TAGS = {
     ['us-gaap', 'WeightedAverageNumberOfSharesOutstandingBasic'],
     ['ifrs-full', 'WeightedAverageNumberOfDilutedSharesOutstanding'],
   ],
-  // Cash flow — absent in v1, which is why FCF was null for every ticker even
-  // where EDGAR answered fine.
+  // Cash flow — absent originally, which is why FCF was null for every ticker
+  // even where EDGAR answered fine.
   cfo: [
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivities'],
     ['us-gaap', 'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations'],
@@ -253,6 +256,20 @@ const TAGS = {
     ['us-gaap', 'PaymentsToAcquirePropertyPlantAndEquipment'],
     ['us-gaap', 'PaymentsToAcquireProductiveAssets'],
     ['ifrs-full', 'PurchaseOfPropertyPlantAndEquipment'],
+  ],
+  // Debt, for the invested-capital denominator. This used to come ONLY from
+  // Yahoo's optional financialData.totalDebt, and a missing field was coerced
+  // to zero — collapsing invested capital to equity-only and inflating ROIC.
+  // For NET that read 19.7% instead of 5.8% and moved the score 21 points
+  // between two otherwise identical runs.
+  debt: [
+    ['us-gaap', 'DebtLongtermAndShorttermCombinedAmount'],
+    ['us-gaap', 'LongTermDebt'],
+    ['us-gaap', 'LongTermDebtNoncurrent'],
+    ['us-gaap', 'ConvertibleNotesPayableNoncurrent'],
+    ['us-gaap', 'ConvertibleLongTermNotesPayable'],
+    ['ifrs-full', 'Borrowings'],
+    ['ifrs-full', 'NoncurrentPortionOfNoncurrentBorrowings'],
   ],
 };
 
@@ -354,19 +371,6 @@ export async function resolveMetrics(symbol, env, refresh = false) {
     // FCF = CFO − capex, aligned on period end. capex is filed positive here.
     const fcf = diffSeries(edgar.cfo, edgar.capex);
     if (fcf && fcf.length >= 2) m.fcf_series = { value: fcf, source: 'edgar' };
-    // ROIC proxy: NI / (equity + debt). Debt is Yahoo's, hence the blend.
-    if (edgar.net_income?.size && edgar.equity?.size) {
-      const yrs = [...edgar.net_income.keys()].filter(y => edgar.equity.has(y)).sort();
-      const y = yrs[yrs.length - 1];
-      if (y != null) {
-        const eq = edgar.equity.get(y), debt = ok ? (summary.total_debt || 0) : 0;
-        if (eq + debt > 0) {
-          const icSrc = debt ? 'edgar+yahoo' : 'edgar';
-          m._ic = { value: eq + debt, source: icSrc };   // reused by the cash-ROIC fallback
-          set('roic', edgar.net_income.get(y) / (eq + debt), icSrc);
-        }
-      }
-    }
   }
 
   // ── Yahoo timeseries fills statement gaps (and carries non-SEC names) ──
@@ -383,14 +387,48 @@ export async function resolveMetrics(symbol, env, refresh = false) {
       const series = direct.length >= 2 ? direct : (derived?.length >= 2 ? derived : null);
       if (series) m.fcf_series = { value: series, source: 'yahoo-ts' };
     }
-    if (!m.roic && ts.netIncome?.size && ts.stockholdersEquity?.size) {
-      const yrs = [...ts.netIncome.keys()].filter(y => ts.stockholdersEquity.has(y)).sort();
-      const y = yrs[yrs.length - 1];
-      if (y != null) {
-        const eq = ts.stockholdersEquity.get(y), debt = ok ? (summary.total_debt || 0) : 0;
-        if (eq + debt > 0) {
-          if (!m._ic) m._ic = { value: eq + debt, source: 'yahoo-ts' };
-          set('roic', ts.netIncome.get(y) / (eq + debt), 'yahoo-ts');
+  }
+
+  // ── Invested capital, then ROIC ────────────────────────────────────────────
+  //
+  // Debt is NEVER defaulted to zero. It used to come only from Yahoo's optional
+  // financialData.totalDebt via `(summary.total_debt || 0)`, so a missing field
+  // silently became "no debt": invested capital collapsed to equity-only and
+  // every return-on-capital figure inflated. For NET that read 19.7% instead of
+  // 5.8% and moved the score 21 points between two identical runs.
+  //
+  // That is the same anti-pattern as the `|| 1` this whole rework began with.
+  // If no source reports debt, invested capital stays unresolved and ROIC comes
+  // back null — which drops out of the denominator. "No data" is honest;
+  // "zero debt" is a fiction.
+  {
+    const eqMap = edgar?.equity?.size ? edgar.equity : (ts?.stockholdersEquity || null);
+    const eqSrc = edgar?.equity?.size ? 'edgar' : 'yahoo-ts';
+    const niMap = edgar?.net_income?.size ? edgar.net_income : (ts?.netIncome || null);
+
+    if (eqMap?.size) {
+      const y = [...eqMap.keys()].sort().pop();
+      const eq = eqMap.get(y);
+
+      // Debt, in order of preference: EDGAR same fiscal year → EDGAR latest
+      // filed → Yahoo timeseries → Yahoo summary. Never zero.
+      let debt = null, debtSrc = null;
+      if (edgar?.debt?.has(y)) {
+        debt = edgar.debt.get(y); debtSrc = 'edgar';
+      } else if (edgar?.debt?.size) {
+        debt = edgar.debt.get([...edgar.debt.keys()].sort().pop()); debtSrc = 'edgar';
+      } else if (ts?.totalDebt?.size) {
+        debt = ts.totalDebt.get([...ts.totalDebt.keys()].sort().pop()); debtSrc = 'yahoo-ts';
+      } else if (ok && typeof summary.total_debt === 'number') {
+        debt = summary.total_debt; debtSrc = 'yahoo';
+      }
+
+      if (debt !== null && eq + debt > 0) {
+        const icSrc = debtSrc.startsWith('yahoo') && eqSrc === 'edgar' ? 'edgar+yahoo' : eqSrc;
+        m._ic = { value: eq + debt, source: icSrc, year: y, debt_source: debtSrc };
+        if (niMap?.size) {
+          const ny = niMap.has(y) ? y : [...niMap.keys()].sort().pop();
+          set('roic', niMap.get(ny) / (eq + debt), icSrc);
         }
       }
     }
@@ -439,8 +477,10 @@ export async function resolveMetrics(symbol, env, refresh = false) {
     set('payout_ratio', summary.payout_ratio, 'yahoo');
     set('gross_margin', summary.gross_margin, 'yahoo');
     set('pe_trailing', summary.pe_trailing, 'yahoo');
-    if (summary.ebitda) {
-      const netDebt = (summary.total_debt || 0) - (summary.total_cash || 0);
+    // Same coercion trap as invested capital — a missing totalDebt must not be
+    // read as a debt-free balance sheet.
+    if (summary.ebitda && typeof summary.total_debt === 'number') {
+      const netDebt = summary.total_debt - (summary.total_cash || 0);
       set('net_debt_ebitda', netDebt / summary.ebitda, 'yahoo');
     }
     if (summary.mktcap_native) {
@@ -478,6 +518,8 @@ export async function resolveMetrics(symbol, env, refresh = false) {
     eps_source: m.eps_cagr?.source || null,
     roic_basis: m.roic?.basis || 'earnings',
     roic_earnings: m.roic?.earnings_roic ?? null,
+    invested_capital: m._ic?.value ?? null,
+    debt_source: m._ic?.debt_source ?? null,
     refresh,
     cache: statsSnapshot(),
   };
