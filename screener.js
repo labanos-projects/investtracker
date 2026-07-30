@@ -76,7 +76,7 @@ function ScreenerView({ user, onRequireLogin }) {
             total_score: data.total, max_score: data.max,
             pct: data.pct, coverage_pct: data.coverage,
             sgr: data.sgr, years_to_10x: data.years_to_10x,
-            conviction: data.conviction,
+            conviction: data.conviction, roic_basis: data.roic_basis,
             red_flags: data.red_flags, scored_at: data.scored_at,
             _unsaved: data.persisted === false,
           },
@@ -234,15 +234,6 @@ function ScreenerView({ user, onRequireLogin }) {
               const stale  = h.conviction?.includes('STALE');
               const barCls  = stale ? 'bg-gray-300'
                 : pctNum >= 70 ? 'bg-emerald-500' : pctNum >= 50 ? 'bg-amber-400' : 'bg-red-400';
-              const badgeCls = stale
-                ? 'bg-gray-100 text-gray-400'
-                : h.conviction?.includes('STRONG')
-                  ? 'bg-emerald-100 text-emerald-600'
-                  : h.conviction?.includes('WATCH')
-                    ? 'bg-amber-100 text-amber-600'
-                    : h.conviction?.includes('INSUFFICIENT')
-                      ? 'bg-gray-100 text-gray-500'
-                      : 'bg-red-50 text-red-400';
               return (
                 <div
                   key={h.ticker}
@@ -250,13 +241,14 @@ function ScreenerView({ user, onRequireLogin }) {
                   onClick={() => handleViewDetail(h.ticker)}
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5 mb-0.5">
+                    <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
                       <span className="font-semibold text-gray-900 text-sm">{h.ticker}</span>
                       {h.conviction && (
-                        <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeCls}`}>
+                        <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeColour(h.conviction)}`}>
                           {h.conviction}
                         </span>
                       )}
+                      <BasisBadge basis={h.roic_basis} />
                       {h._unsaved && (
                         <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full bg-red-50 text-red-500">
                           not saved
@@ -303,13 +295,34 @@ const SCORE_CLS = { 2: 'text-emerald-500', 1: 'text-amber-500', 0: 'text-red-400
 const SOURCE_LABEL = {
   edgar: 'EDGAR', 'edgar+yahoo': 'EDGAR', yahoo: 'Yahoo', 'yahoo-ts': 'Yahoo', fmp: 'FMP',
   'ai-grounded': 'AI', computed: 'calc', none: 'no data',
+  'edgar/fcf': 'EDGAR', 'edgar+yahoo/fcf': 'EDGAR', 'yahoo-ts/fcf': 'Yahoo',
 };
 const SOURCE_CLS = {
   edgar: 'bg-emerald-50 text-emerald-600', 'edgar+yahoo': 'bg-emerald-50 text-emerald-600',
   yahoo: 'bg-blue-50 text-blue-500', 'yahoo-ts': 'bg-blue-50 text-blue-500', fmp: 'bg-blue-50 text-blue-500',
   'ai-grounded': 'bg-purple-50 text-purple-500', computed: 'bg-gray-100 text-gray-500',
   none: 'bg-gray-50 text-gray-300',
+  'edgar/fcf': 'bg-emerald-50 text-emerald-600', 'edgar+yahoo/fcf': 'bg-emerald-50 text-emerald-600',
+  'yahoo-ts/fcf': 'bg-blue-50 text-blue-500',
 };
+
+/**
+ * Marks a score whose compounding engine was measured on CASH rather than
+ * accounting earnings — i.e. the company is not yet profitable and the engine
+ * is a candidate, not a track record. Renders nothing in the normal case;
+ * it's an exception marker, not decoration.
+ */
+function BasisBadge({ basis }) {
+  if (basis !== 'fcf') return null;
+  return (
+    <span
+      className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-600"
+      title="ROIC measured as FCF ÷ invested capital — accounting earnings are still negative, so the compounding engine is unproven"
+    >
+      cash roic
+    </span>
+  );
+}
 
 function pctColour(pct, conviction) {
   if (conviction?.includes('INSUFFICIENT') || conviction?.includes('STALE')) return 'text-gray-400';
@@ -339,11 +352,12 @@ function ScoreCard({ result, onViewFull }) {
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 mb-4">
       <div className="flex items-start justify-between mb-2">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="font-bold text-gray-900 text-base">{result.ticker}</span>
             <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeCls}`}>
               {result.conviction}
             </span>
+            <BasisBadge basis={result.roic_basis} />
           </div>
           <div className="text-[11px] text-gray-400 mt-0.5">{result.company} · {result.sector}</div>
         </div>
@@ -381,6 +395,13 @@ function ScoreCard({ result, onViewFull }) {
           {result.persist_status === 401
             ? ' Your session expired — sign in again and re-score.'
             : ' This result will disappear on reload.'}
+        </div>
+      )}
+
+      {result.roic_basis === 'fcf' && (
+        <div className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded px-2 py-1.5 mb-3">
+          Compounding measured on <strong>cash</strong>, not earnings — this company isn't
+          profitable yet, so the engine is a candidate rather than a track record.
         </div>
       )}
 
@@ -450,6 +471,7 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
   const coverage = parseFloat(data.coverage_pct ?? data.coverage ?? 0);
   const sgr      = data.sgr != null ? parseFloat(data.sgr) : null;
   const y10      = data.years_to_10x ?? null;
+  const basis    = data.roic_basis || data.diagnostics?.roic_basis || 'earnings';
   const barCls   = barColour(pct, data.conviction);
   const textCls  = pctColour(pct, data.conviction);
   const badgeCls = badgeColour(data.conviction);
@@ -463,13 +485,14 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
       <div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center gap-3 sticky top-0 z-10">
         <button onClick={onBack} className="text-gray-400 hover:text-gray-700 text-sm shrink-0">← Back</button>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 flex-wrap">
             <span className="font-bold text-gray-900">{data.ticker}</span>
             {data.conviction && (
               <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeCls}`}>
                 {data.conviction}
               </span>
             )}
+            <BasisBadge basis={basis} />
           </div>
           <div className="text-[10px] text-gray-400 truncate">{data.company}</div>
         </div>
@@ -499,6 +522,14 @@ function ScoreDetail({ data, onBack, onDelete, user }) {
             </div>
           ))}
         </div>
+
+        {basis === 'fcf' && (
+          <div className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2 mb-4">
+            <strong>Cash basis.</strong> Accounting earnings are still negative, so the
+            compounding engine is measured as FCF ÷ invested capital. Treat it as a
+            candidate to investigate, not a demonstrated track record.
+          </div>
+        )}
 
         {/* Red flags */}
         {data.red_flags?.length > 0 && (
