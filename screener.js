@@ -54,13 +54,20 @@ function ScreenerView({ user, onRequireLogin }) {
     fetch(`${WORKER_URL}?score_ticker=${encodeURIComponent(sym)}`, { headers: authHeaders() })
       .then(async r => {
         const data = await r.json();
-        if (!r.ok) throw new Error(data.error || 'Scoring failed');
+        if (!r.ok) {
+          const err = new Error(data.error || 'Scoring failed');
+          err.status = r.status;
+          err.code = data.code;
+          throw err;
+        }
         return data;
       })
       .then(data => {
         setResult(data);
         setLoading(false);
-        // Merge into history list (most-recent first)
+        // Merge into history list (most-recent first). `persisted` tells us
+        // whether the row actually reached the DB — if not, it will disappear
+        // on reload, so don't let the list imply otherwise.
         setHistory(prev => [
           {
             ticker: data.ticker, company: data.company, sector: data.sector,
@@ -71,13 +78,24 @@ function ScreenerView({ user, onRequireLogin }) {
             sgr: data.sgr, years_to_10x: data.years_to_10x,
             conviction: data.conviction,
             red_flags: data.red_flags, scored_at: data.scored_at,
+            _unsaved: data.persisted === false,
           },
           ...prev.filter(h => h.ticker !== data.ticker),
         ]);
       })
       .catch(err => {
-        setError(err.message || 'Scoring failed');
         setLoading(false);
+        // auth.php rotates api_token on every login, so a token left in
+        // localStorage after signing in elsewhere is stale. The app looked
+        // logged in, scoring appeared to work, and the save failed silently.
+        // Clear it and re-prompt rather than leaving that state in place.
+        if (err.status === 401 || err.code === 'token_invalid') {
+          try { localStorage.removeItem('auth_token'); } catch {}
+          setError('Session expired — please sign in again.');
+          if (onRequireLogin) onRequireLogin(doAnalyze);
+          return;
+        }
+        setError(err.message || 'Scoring failed');
       });
   };
 
@@ -179,7 +197,7 @@ function ScreenerView({ user, onRequireLogin }) {
         {loading && (
           <div className="mt-2.5 text-xs text-gray-400 flex items-center gap-1.5">
             <span className="spin inline-block">↻</span>
-            Pulling filings (EDGAR / Yahoo) + grounded AI research — ~20–30 seconds
+            Pulling filings (EDGAR / Yahoo) + grounded AI research — ~10–30 seconds
           </div>
         )}
         {!user && (
@@ -239,6 +257,11 @@ function ScreenerView({ user, onRequireLogin }) {
                           {h.conviction}
                         </span>
                       )}
+                      {h._unsaved && (
+                        <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full bg-red-50 text-red-500">
+                          not saved
+                        </span>
+                      )}
                       {h.red_flags?.length > 0 && <span className="text-amber-400 text-[10px]">⚠</span>}
                     </div>
                     <div className="text-[11px] text-gray-400 truncate mb-1.5">
@@ -278,12 +301,12 @@ const SCORE_SYM = { 2: '✓', 1: '∼', 0: '✗', null: '–' };
 const SCORE_CLS = { 2: 'text-emerald-500', 1: 'text-amber-500', 0: 'text-red-400', null: 'text-gray-300' };
 
 const SOURCE_LABEL = {
-  edgar: 'EDGAR', 'edgar+yahoo': 'EDGAR', yahoo: 'Yahoo', fmp: 'FMP',
+  edgar: 'EDGAR', 'edgar+yahoo': 'EDGAR', yahoo: 'Yahoo', 'yahoo-ts': 'Yahoo', fmp: 'FMP',
   'ai-grounded': 'AI', computed: 'calc', none: 'no data',
 };
 const SOURCE_CLS = {
   edgar: 'bg-emerald-50 text-emerald-600', 'edgar+yahoo': 'bg-emerald-50 text-emerald-600',
-  yahoo: 'bg-blue-50 text-blue-500', fmp: 'bg-blue-50 text-blue-500',
+  yahoo: 'bg-blue-50 text-blue-500', 'yahoo-ts': 'bg-blue-50 text-blue-500', fmp: 'bg-blue-50 text-blue-500',
   'ai-grounded': 'bg-purple-50 text-purple-500', computed: 'bg-gray-100 text-gray-500',
   none: 'bg-gray-50 text-gray-300',
 };
@@ -310,6 +333,7 @@ function ScoreCard({ result, onViewFull }) {
   const textCls = pctColour(pct, result.conviction);
   const badgeCls = badgeColour(result.conviction);
   const lowCoverage = (result.coverage ?? 100) < 70;
+  const notSaved = result.persisted === false;
 
   return (
     <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-4 mb-4">
@@ -347,6 +371,18 @@ function ScoreCard({ result, onViewFull }) {
           </div>
         ))}
       </div>
+
+      {/* A score that didn't reach the DB used to look identical to one that
+          did, then vanish on reload. Say so instead. */}
+      {notSaved && (
+        <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded px-2 py-1.5 mb-3">
+          ⚠ <strong>Not saved.</strong> Scored fine, but the database rejected it
+          {result.persist_status ? ` (HTTP ${result.persist_status})` : ''}.
+          {result.persist_status === 401
+            ? ' Your session expired — sign in again and re-score.'
+            : ' This result will disappear on reload.'}
+        </div>
+      )}
 
       {lowCoverage && (
         <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1.5 mb-3">
