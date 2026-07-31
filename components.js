@@ -310,7 +310,10 @@ function SetupModal({ onComplete }) {
   );
 }
 
-function AddHoldingModal({ onClose, onAdded, portfolioId }) {
+// `prefill` is passed by TickerPage — the company is already on screen, so the
+// modal opens on the transaction fields rather than making you search for a
+// ticker you are currently looking at.
+function AddHoldingModal({ onClose, onAdded, portfolioId, prefill }) {
   const { useState, useEffect, useRef } = React;
   const today = new Date().toISOString().split('T')[0];
 
@@ -318,12 +321,15 @@ function AddHoldingModal({ onClose, onAdded, portfolioId }) {
   const [query,       setQuery]       = useState('');
   const [results,     setResults]     = useState([]);
   const [searching,   setSearching]   = useState(false);
-  const [selected,    setSelected]    = useState(null);
+  const [selected,    setSelected]    = useState(prefill ? { symbol: prefill.yhTicker } : null);
   const debounceRef = useRef(null);
 
-  // Form state (populated from search result or manual entry)
+  // Form state (populated from prefill, search result, or manual entry)
   const [form, setForm] = useState({
-    ticker: '', yhTicker: '', company: '', ccy: 'USD',
+    ticker:   prefill?.ticker   || '',
+    yhTicker: prefill?.yhTicker || '',
+    company:  prefill?.company  || '',
+    ccy:      prefill?.ccy      || 'USD',
     date: today, type: 'buy', shares: '', price: '', fees: '0', note: '',
   });
   const [saving, setSaving] = useState(false);
@@ -414,11 +420,20 @@ function AddHoldingModal({ onClose, onAdded, portfolioId }) {
       <div className="relative bg-white w-full sm:max-w-md sm:rounded-2xl rounded-t-2xl shadow-2xl px-4 pt-4 pb-8 max-h-[90vh] overflow-y-auto">
 
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-[15px] font-bold text-gray-900">Add New Holding</h2>
+          <h2 className="text-[15px] font-bold text-gray-900">
+            {prefill ? `Add ${prefill.ticker} to Portfolio` : 'Add New Holding'}
+          </h2>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
         </div>
 
-        {/* ── Ticker Search ── */}
+        {/* ── Ticker Search — skipped when the company is already known ── */}
+        {prefill ? (
+          <div className="mb-4 flex items-center gap-1.5 text-[12px] text-blue-600 bg-blue-50 px-2.5 py-2 rounded-lg">
+            <span className="font-semibold mono">{form.yhTicker || form.ticker}</span>
+            <span className="text-gray-400">·</span>
+            <span className="truncate">{form.company}</span>
+          </div>
+        ) : (
         <div className="mb-4 relative">
           <label className="text-[10px] text-gray-400 uppercase tracking-wide block mb-0.5">Search Ticker</label>
           <div className="relative">
@@ -456,6 +471,7 @@ function AddHoldingModal({ onClose, onAdded, portfolioId }) {
             </div>
           )}
         </div>
+        )}
 
         {/* ── Manual fields ── */}
         <div className="border-t border-gray-100 pt-3 mb-3">
