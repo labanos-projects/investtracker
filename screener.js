@@ -1,5 +1,5 @@
-// ─── ScreenerView ────────────────────────────────────────────────────────────────────────────────
-function ScreenerView({ user, onRequireLogin }) {
+// ─── ScreenerView ─────────────────────────────────────────────────────────────────────────
+function ScreenerView({ user, onRequireLogin, onOpenTicker }) {
   const [query,        setQuery]        = useState('');
   const [suggestions,  setSuggestions]  = useState([]);
   const [selected,     setSelected]     = useState(null);
@@ -8,10 +8,19 @@ function ScreenerView({ user, onRequireLogin }) {
   const [error,        setError]        = useState(null);
   const [history,      setHistory]      = useState([]);
   const [histLoading,  setHistLoading]  = useState(true);
-  const [detailTicker, setDetailTicker] = useState(null);
-  const [detailData,   setDetailData]   = useState(null);
-  const [detailLoad,   setDetailLoad]   = useState(false);
   const debounceRef = React.useRef(null);
+
+  // Opening a scored company now hands off to the shared TickerPage rather
+  // than a screener-only detail view: the score is one section of a company
+  // page that also carries price, chart, valuation, news and notes.
+  const openTicker = (h) => onOpenTicker({
+    ticker:   h.ticker,
+    yhTicker: h.ticker,      // screener symbols come from Yahoo search
+    company:  h.company || null,
+    ccy:      null,          // resolved from the ?quote= snapshot
+    sector:   h.sector || null,
+    origin:   'screener',
+  });
 
   // Load history on mount
   useEffect(() => {
@@ -51,17 +60,7 @@ function ScreenerView({ user, onRequireLogin }) {
     setLoading(true);
     setError(null);
     setResult(null);
-    fetch(`${WORKER_URL}?score_ticker=${encodeURIComponent(sym)}`, { headers: authHeaders() })
-      .then(async r => {
-        const data = await r.json();
-        if (!r.ok) {
-          const err = new Error(data.error || 'Scoring failed');
-          err.status = r.status;
-          err.code = data.code;
-          throw err;
-        }
-        return data;
-      })
+    requestScore(sym)
       .then(data => {
         setResult(data);
         setLoading(false);
@@ -104,18 +103,6 @@ function ScreenerView({ user, onRequireLogin }) {
     doAnalyze();
   };
 
-  const handleViewDetail = async (ticker) => {
-    setDetailTicker(ticker);
-    setDetailData(null);
-    setDetailLoad(true);
-    try {
-      const res  = await fetch(`${SCREENER_API}?ticker=${encodeURIComponent(ticker)}`);
-      const data = res.ok ? await res.json() : null;
-      setDetailData(data);
-    } catch { setDetailData(null); }
-    setDetailLoad(false);
-  };
-
   const handleDelete = async (ticker) => {
     if (!user || !confirm(`Delete analysis for ${ticker}?`)) return;
     try {
@@ -123,32 +110,11 @@ function ScreenerView({ user, onRequireLogin }) {
         method: 'POST', headers: authHeaders(),
       });
       setHistory(prev => prev.filter(h => h.ticker !== ticker));
-      if (detailTicker === ticker) { setDetailTicker(null); setDetailData(null); }
       if (result?.ticker === ticker) setResult(null);
     } catch {}
   };
 
-  // ── Detail view (full page) ────────────────────────────────────────────────
-  if (detailTicker) {
-    if (detailLoad || !detailData) {
-      return (
-        <div className="flex items-center justify-center h-64 gap-2 text-gray-400">
-          <span className="spin text-xl">↻</span>
-          <span className="text-sm">Loading {detailTicker}…</span>
-        </div>
-      );
-    }
-    return (
-      <ScoreDetail
-        data={detailData}
-        onBack={() => { setDetailTicker(null); setDetailData(null); }}
-        onDelete={handleDelete}
-        user={user}
-      />
-    );
-  }
-
-  // ── Main view ──────────────────────────────────────────────────────────────
+  // ── Main view ───────────────────────────────────────────────────────────────
   return (
     <div className="max-w-xl mx-auto px-4 py-4">
 
@@ -209,7 +175,7 @@ function ScreenerView({ user, onRequireLogin }) {
 
       {/* ── Score result card ── */}
       {result && !loading && (
-        <ScoreCard result={result} onViewFull={() => handleViewDetail(result.ticker)} />
+        <ScoreCard result={result} onViewFull={() => openTicker(result)} />
       )}
 
       {/* ── History list ── */}
@@ -238,7 +204,7 @@ function ScreenerView({ user, onRequireLogin }) {
                 <div
                   key={h.ticker}
                   className="px-4 py-3 flex items-center gap-3 hover:bg-gray-50 cursor-pointer"
-                  onClick={() => handleViewDetail(h.ticker)}
+                  onClick={() => openTicker(h)}
                 >
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-1.5 mb-0.5 flex-wrap">
@@ -285,7 +251,7 @@ function ScreenerView({ user, onRequireLogin }) {
   );
 }
 
-// ─── Shared presentation helpers ──────────────────────────────────────────────
+// ─── Shared presentation helpers ───────────────────────────────────────────────
 // A criterion with score === null had NO DATA. It is excluded from both the
 // numerator and the denominator, so it must not render like a failure — that
 // conflation is exactly what the old model got wrong.
@@ -339,7 +305,7 @@ function badgeColour(conviction) {
   return 'bg-red-50 text-red-400';
 }
 
-// ─── ScoreCard — compact inline result ─────────────────────────────────────────────────────
+// ─── ScoreCard — compact inline result ────────────────────────────────────────────────
 function ScoreCard({ result, onViewFull }) {
   const pct     = result.pct || 0;
   const barCls  = barColour(pct, result.conviction);
@@ -427,182 +393,343 @@ function ScoreCard({ result, onViewFull }) {
   );
 }
 
-// ─── ScoreDetail — full criteria breakdown ───────────────────────────────────────────────────
-function ScoreDetail({ data, onBack, onDelete, user }) {
-  if (!data) {
-    return <div className="flex items-center justify-center h-48 text-gray-400 text-sm">No data</div>;
+// ─── Criteria rubric — mirrors cloudflare/screener_engine.js RUBRIC ──────────
+const CRITERIA_ORDER = [
+  // Tier 1 — the compounding engine (weight 3)
+  { id: 'reinvestment',  label: 'Reinvestment engine (ROIC × retention)', weight: 3, tier: 1 },
+  { id: 'roic',          label: 'ROIC ≥ 20%',                             weight: 3, tier: 1 },
+  { id: 'rev_growth',    label: 'Revenue CAGR ≥ 20%',                     weight: 3, tier: 1 },
+  { id: 'runway',        label: 'TAM headroom / reinvestment runway',     weight: 3, tier: 1 },
+  { id: 'moat',          label: 'Durable moat (20yr+)',                   weight: 3, tier: 1 },
+  // Tier 2 — multibagger preconditions (weight 2)
+  { id: 'size_headroom', label: 'Size headroom (room to 10–100×)',        weight: 2, tier: 2 },
+  { id: 'insider_own',   label: 'Owner-operator (insiders ≥ 10%)',        weight: 2, tier: 2 },
+  { id: 'gross_margin',  label: 'Gross margin vs sector',                 weight: 2, tier: 2 },
+  { id: 'fcf',           label: 'FCF positive & growing',                 weight: 2, tier: 2 },
+  { id: 'debt',          label: 'Net debt / EBITDA < 1.5×',               weight: 2, tier: 2 },
+  { id: 'cap_alloc',     label: 'Capital allocation quality',             weight: 2, tier: 2 },
+  // Tier 3 — entry & hygiene (weight 1)
+  { id: 'peg',           label: 'PEG < 1 (entry multiple)',               weight: 1, tier: 3 },
+  { id: 'eps_growth',    label: 'EPS CAGR ≥ 15%',                         weight: 1, tier: 3 },
+  { id: 'shares',        label: 'No dilution',                            weight: 1, tier: 3 },
+  { id: 'industry',      label: 'Industry stability',                     weight: 1, tier: 3 },
+  { id: 'disclosure',    label: 'Management transparency',                weight: 1, tier: 3 },
+  { id: 'insider_buy',   label: 'Insiders net buying',                    weight: 1, tier: 3 },
+];
+
+const TIER_LABEL = {
+  1: 'Tier 1 — Compounding engine  (×3)',
+  2: 'Tier 2 — Multibagger preconditions  (×2)',
+  3: 'Tier 3 — Entry & hygiene  (×1)',
+};
+
+/**
+ * ScoreBreakdown — the criteria list, grounding citations and footer, with no
+ * page chrome of its own. Extracted from the old ScoreDetail so the same
+ * breakdown renders inside the shared ticker page from either entry point;
+ * duplicating it was how the screener and the holding view would drift apart.
+ *
+ * Accepts either shape: a fresh Worker result (`criteria`, `total`, `max`) or
+ * a DB row (`score_data`, `total_score`, `max_score`).
+ */
+function ScoreBreakdown({ data }) {
+  if (!data) return null;
+  const criteria = data.score_data || data.criteria || {};
+  const sources  = data.sources || [];
+  let lastTier = null;
+
+  return (
+    <div>
+      {CRITERIA_ORDER.map(def => {
+        const c = criteria[def.id];
+        if (!c) return null;
+        const showTier = def.tier !== lastTier;
+        lastTier = def.tier;
+        const scoreKey = (c.score === null || c.score === undefined) ? null : c.score;
+        const isNull   = scoreKey === null;
+        const srcKey   = c.source || 'none';
+        return (
+          <React.Fragment key={def.id}>
+            {showTier && (
+              <div className="pt-4 pb-1.5 text-[9px] font-bold text-gray-400 uppercase tracking-widest">
+                {TIER_LABEL[def.tier]}
+              </div>
+            )}
+            <div className={`flex items-start gap-2 py-2 border-b border-gray-50 last:border-0 ${isNull ? 'opacity-60' : ''}`}>
+              <span className={`${SCORE_CLS[scoreKey]} font-bold text-sm w-4 shrink-0 mt-px leading-tight`}>
+                {SCORE_SYM[scoreKey]}
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[11px] font-medium text-gray-700 leading-tight flex items-center gap-1.5">
+                  {def.label}
+                  <span className={`text-[8px] px-1 py-px rounded uppercase tracking-wide ${SOURCE_CLS[srcKey] || SOURCE_CLS.none}`}>
+                    {SOURCE_LABEL[srcKey] || srcKey}
+                  </span>
+                </div>
+                <div className="text-[10px] text-gray-400 leading-snug mt-0.5">{c.note}</div>
+              </div>
+              <span className="text-[10px] text-gray-300 mono shrink-0">
+                {isNull ? 'n/a' : `${c.score * def.weight}/${def.weight * 2}`}
+              </span>
+            </div>
+          </React.Fragment>
+        );
+      })}
+
+      {/* Grounding citations — what the AI half actually read */}
+      {sources.length > 0 && (
+        <div className="pt-4">
+          <div className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pb-1.5">Sources</div>
+          <div className="flex flex-wrap gap-1">
+            {sources.map((s, i) => (
+              <a key={i} href={s} target="_blank" rel="noopener noreferrer"
+                 className="text-[9px] text-blue-500 hover:text-blue-700 bg-blue-50 rounded px-1.5 py-0.5 truncate max-w-[46%]">
+                {(() => { try { return new URL(s).hostname.replace(/^www\./, ''); } catch { return s; } })()}
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="pt-3 text-[10px] text-gray-300 text-center">
+        Scored {data.scored_at}{data.sector ? ` · ${data.sector}` : ''}{data.industry ? ` · ${data.industry}` : ''}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * requestScore — the Worker scoring call, shared by the screener search box and
+ * the score block on the ticker page. Rejects with `status`/`code` attached so
+ * both callers can apply the same stale-token handling (auth.php rotates
+ * api_token on every login, so a token left in localStorage is silently dead).
+ */
+async function requestScore(symbol) {
+  const res  = await fetch(`${WORKER_URL}?score_ticker=${encodeURIComponent(symbol)}`, { headers: authHeaders() });
+  const data = await res.json();
+  if (!res.ok) {
+    const err = new Error(data.error || 'Scoring failed');
+    err.status = res.status;
+    err.code   = data.code;
+    throw err;
   }
+  return data;
+}
 
-  // Order and labels mirror cloudflare/screener_engine.js RUBRIC.
-  const CRITERIA_ORDER = [
-    // Tier 1 — the compounding engine (weight 3)
-    { id: 'reinvestment',  label: 'Reinvestment engine (ROIC × retention)', weight: 3, tier: 1 },
-    { id: 'roic',          label: 'ROIC ≥ 20%',                             weight: 3, tier: 1 },
-    { id: 'rev_growth',    label: 'Revenue CAGR ≥ 20%',                     weight: 3, tier: 1 },
-    { id: 'runway',        label: 'TAM headroom / reinvestment runway',     weight: 3, tier: 1 },
-    { id: 'moat',          label: 'Durable moat (20yr+)',                   weight: 3, tier: 1 },
-    // Tier 2 — multibagger preconditions (weight 2)
-    { id: 'size_headroom', label: 'Size headroom (room to 10–100×)',        weight: 2, tier: 2 },
-    { id: 'insider_own',   label: 'Owner-operator (insiders ≥ 10%)',        weight: 2, tier: 2 },
-    { id: 'gross_margin',  label: 'Gross margin vs sector',                 weight: 2, tier: 2 },
-    { id: 'fcf',           label: 'FCF positive & growing',                 weight: 2, tier: 2 },
-    { id: 'debt',          label: 'Net debt / EBITDA < 1.5×',               weight: 2, tier: 2 },
-    { id: 'cap_alloc',     label: 'Capital allocation quality',             weight: 2, tier: 2 },
-    // Tier 3 — entry & hygiene (weight 1)
-    { id: 'peg',           label: 'PEG < 1 (entry multiple)',               weight: 1, tier: 3 },
-    { id: 'eps_growth',    label: 'EPS CAGR ≥ 15%',                         weight: 1, tier: 3 },
-    { id: 'shares',        label: 'No dilution',                            weight: 1, tier: 3 },
-    { id: 'industry',      label: 'Industry stability',                     weight: 1, tier: 3 },
-    { id: 'disclosure',    label: 'Management transparency',                weight: 1, tier: 3 },
-    { id: 'insider_buy',   label: 'Insiders net buying',                    weight: 1, tier: 3 },
-  ];
+/**
+ * ScoreBlock — the screener verdict as a section of the shared ticker page.
+ * Self-contained: loads the stored result for the ticker, offers to score it
+ * when there is none, and expands to the full criteria breakdown in place.
+ */
+function ScoreBlock({ ticker, altTicker, user, onRequireLogin, onDeleted }) {
+  const [data,     setData]     = useState(undefined);   // undefined = loading, null = never scored
+  const [expanded, setExpanded] = useState(false);
+  const [scoring,  setScoring]  = useState(false);
+  const [error,    setError]    = useState(null);
 
-  const TIER_LABEL = {
-    1: 'Tier 1 — Compounding engine  (×3)',
-    2: 'Tier 2 — Multibagger preconditions  (×2)',
-    3: 'Tier 3 — Entry & hygiene  (×1)',
+  // Two keys, one company: the screener stores the Yahoo symbol it scored,
+  // the portfolio stores the internal ticker. Try the primary key, then the
+  // alternate, so a holding doesn't read as "never scored" just because the
+  // score was saved under its suffixed symbol. Re-scoring writes under the
+  // Yahoo symbol, which is the key the Worker can actually resolve.
+  const load = useCallback(() => {
+    if (!ticker) return;
+    setData(undefined);
+    const get = (sym) => fetch(`${SCREENER_API}?ticker=${encodeURIComponent(sym)}`)
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null);
+    get(ticker)
+      .then(row => (row || !altTicker || altTicker === ticker) ? row : get(altTicker))
+      .then(row => setData(row || null))
+      .catch(() => setData(null));
+  }, [ticker, altTicker]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const runScore = () => {
+    setScoring(true);
+    setError(null);
+    requestScore(ticker)
+      .then(fresh => {
+        setScoring(false);
+        // Normalise the Worker shape onto the DB shape the rest of this
+        // component reads, so a fresh score and a stored one render alike.
+        setData({
+          ...fresh,
+          score_data:   fresh.criteria,
+          total_score:  fresh.total,
+          max_score:    fresh.max,
+          coverage_pct: fresh.coverage,
+        });
+        if (fresh.persisted === false) setError('Scored, but the database rejected the save — this will disappear on reload.');
+      })
+      .catch(err => {
+        setScoring(false);
+        if (err.status === 401 || err.code === 'token_invalid') {
+          try { localStorage.removeItem('auth_token'); } catch {}
+          setError('Session expired — sign in again.');
+          if (onRequireLogin) onRequireLogin(runScore);
+          return;
+        }
+        setError(err.message || 'Scoring failed');
+      });
   };
 
-  // Criteria come from fresh result (data.criteria) or DB load (data.score_data)
-  const criteria = data.score_data || data.criteria || {};
-  const pct      = parseFloat(data.pct) || 0;
+  const handleScoreClick = () => { if (!user) { onRequireLogin(runScore); return; } runScore(); };
+
+  const handleDelete = async () => {
+    if (!confirm(`Delete the screener analysis for ${ticker}?`)) return;
+    try {
+      await fetch(`${SCREENER_API}?ticker=${encodeURIComponent(ticker)}&_method=DELETE`, {
+        method: 'POST', headers: authHeaders(),
+      });
+      setData(null);
+      setExpanded(false);
+      if (onDeleted) onDeleted(ticker);
+    } catch { setError('Could not delete.'); }
+  };
+
+  // A plain render function, not a component: a component defined inline gets a
+  // new identity on every render and would remount its subtree each time.
+  const header = (right) => (
+    <div className="flex items-center justify-between mb-2">
+      <h2 className="text-[13px] font-semibold text-gray-600 uppercase tracking-wide">Screener Score</h2>
+      {right}
+    </div>
+  );
+
+  // ── Loading ──────────────────────────────────────────────────────────────
+  if (data === undefined) {
+    return (
+      <div className="mx-4 mb-4">
+        {header()}
+        <div className="bg-white rounded-xl border border-gray-100 shadow-sm px-4 py-5 text-center text-gray-300 text-[12px]">
+          <span className="spin inline-block mr-1">↻</span> Loading score…
+        </div>
+      </div>
+    );
+  }
+
+  // ── Never scored ────────────────────────────────────────────────────────
+  if (data === null) {
+    return (
+      <div className="mx-4 mb-4">
+        {header()}
+        <div className="bg-white rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center">
+          <div className="text-[13px] text-gray-400 mb-1">Not scored against the multibagger rubric yet</div>
+          {error && <div className="text-[11px] text-red-500 mb-2">{error}</div>}
+          <button
+            onClick={handleScoreClick}
+            disabled={scoring}
+            className="inline-flex items-center gap-1.5 bg-gray-900 text-white text-[12px] font-medium px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-50 transition-colors mt-2">
+            {scoring
+              ? <><span className="spin inline-block">↻</span> Scoring — ~10–30s…</>
+              : '✦ Score this company'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Scored ─────────────────────────────────────────────────────────────
+  const pctNum   = parseFloat(data.pct) || 0;
   const total    = data.total_score ?? data.total ?? 0;
   const max      = data.max_score   ?? data.max   ?? 0;
   const coverage = parseFloat(data.coverage_pct ?? data.coverage ?? 0);
   const sgr      = data.sgr != null ? parseFloat(data.sgr) : null;
   const y10      = data.years_to_10x ?? null;
+  const y100     = data.years_to_100x ?? null;
   const basis    = data.roic_basis || data.diagnostics?.roic_basis || 'earnings';
-  const barCls   = barColour(pct, data.conviction);
-  const textCls  = pctColour(pct, data.conviction);
-  const badgeCls = badgeColour(data.conviction);
-  const sources  = data.sources || [];
-
-  let lastTier = null;
+  const barCls   = barColour(pctNum, data.conviction);
+  const textCls  = pctColour(pctNum, data.conviction);
 
   return (
-    <div className="max-w-xl mx-auto">
-      {/* Sticky header */}
-      <div className="bg-white border-b border-gray-100 px-4 py-3 flex items-center gap-3 sticky top-0 z-10">
-        <button onClick={onBack} className="text-gray-400 hover:text-gray-700 text-sm shrink-0">← Back</button>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="font-bold text-gray-900">{data.ticker}</span>
+    <div className="mx-4 mb-4">
+      {header(user ? (
+        <button onClick={handleScoreClick} disabled={scoring} title="Re-score with fresh data"
+          className="text-[10px] text-gray-400 hover:text-gray-700 disabled:opacity-40 transition-colors flex items-center gap-1">
+          {scoring
+            ? <><span className="spin inline-block">↻</span> <span>Scoring…</span></>
+            : <><span>✦</span> <span>Re-score</span></>}
+        </button>
+      ) : null)}
+
+      <div className="bg-white rounded-xl border border-gray-100 shadow-sm px-4 py-3">
+        <div className="flex items-start justify-between mb-2">
+          <div className="flex items-center gap-1.5 flex-wrap min-w-0">
             {data.conviction && (
-              <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeCls}`}>
+              <span className={`text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full ${badgeColour(data.conviction)}`}>
                 {data.conviction}
               </span>
             )}
             <BasisBadge basis={basis} />
+            {data.red_flags?.length > 0 && (
+              <span className="text-[9px] font-semibold uppercase px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600">
+                {data.red_flags.length} flag{data.red_flags.length === 1 ? '' : 's'}
+              </span>
+            )}
           </div>
-          <div className="text-[10px] text-gray-400 truncate">{data.company}</div>
-        </div>
-        <div className="text-right shrink-0">
-          <div className={`font-bold mono text-base ${textCls}`}>{pct.toFixed(0)}%</div>
-          <div className="text-[10px] text-gray-300 mono">{total}/{max}</div>
-        </div>
-      </div>
-
-      <div className="px-4 py-4">
-        {/* Score bar */}
-        <div className="w-full bg-gray-100 rounded-full h-2 mb-4">
-          <div className={`${barCls} h-2 rounded-full`} style={{ width: `${pct}%` }} />
+          <div className="text-right shrink-0">
+            <div className={`text-[22px] font-bold mono leading-none ${textCls}`}>{pctNum.toFixed(0)}%</div>
+            <div className="text-[10px] text-gray-400 mono mt-0.5">{total}/{max}</div>
+          </div>
         </div>
 
-        {/* Summary row */}
-        <div className="grid grid-cols-4 gap-2 mb-4">
+        <div className="w-full bg-gray-100 rounded-full h-1.5 mb-3">
+          <div className={`${barCls} h-1.5 rounded-full`} style={{ width: `${Math.min(100, pctNum)}%` }} />
+        </div>
+
+        <div className="grid grid-cols-4 gap-2">
           {[
             ['Compounding', sgr != null ? `${sgr.toFixed(0)}%/yr` : '—'],
-            ['→ 10×',       y10 ? `~${y10} yrs` : '—'],
-            ['Coverage',    coverage ? `${coverage.toFixed(0)}%` : '—'],
-            ['Verdict',     data.conviction || '—'],
+            ['→ 10×',  y10  ? `~${y10} yrs`  : '—'],
+            ['→ 100×', y100 ? `~${y100} yrs` : '—'],
+            ['Coverage', coverage ? `${coverage.toFixed(0)}%` : '—'],
           ].map(([label, val]) => (
             <div key={label} className="bg-gray-50 rounded-lg px-2 py-2 text-center overflow-hidden">
               <div className="text-[9px] text-gray-400 uppercase tracking-wide">{label}</div>
-              <div className={`font-semibold text-[11px] mt-0.5 truncate ${label === 'Verdict' ? textCls : 'text-gray-800 mono'}`}>{val}</div>
+              <div className="font-semibold text-gray-800 mono text-[11px] truncate mt-0.5">{val}</div>
             </div>
           ))}
         </div>
 
+        {error && <div className="mt-3 text-[11px] text-red-500 bg-red-50 rounded px-2 py-1.5">{error}</div>}
+
         {basis === 'fcf' && (
-          <div className="text-xs text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-3 py-2 mb-4">
-            <strong>Cash basis.</strong> Accounting earnings are still negative, so the
-            compounding engine is measured as FCF ÷ invested capital. Treat it as a
-            candidate to investigate, not a demonstrated track record.
+          <div className="mt-3 text-[11px] text-indigo-700 bg-indigo-50 border border-indigo-100 rounded px-2 py-1.5">
+            Compounding measured on <strong>cash</strong>, not earnings — this company isn't
+            profitable yet, so the engine is a candidate rather than a track record.
           </div>
         )}
 
-        {/* Red flags */}
+        {coverage > 0 && coverage < 70 && (
+          <div className="mt-3 text-[11px] text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1.5">
+            Only {coverage.toFixed(0)}% of the rubric had data behind it — score withheld.
+          </div>
+        )}
+
         {data.red_flags?.length > 0 && (
-          <div className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2 mb-4">
-            ⚠ <strong>Red flags:</strong> {data.red_flags.join(' · ')}
+          <div className="mt-3 text-[11px] text-amber-700 bg-amber-50 border border-amber-100 rounded px-2 py-1.5">
+            ⚠ {data.red_flags.join(' · ')}
           </div>
         )}
 
-        {/* Criteria list */}
-        <div>
-          {CRITERIA_ORDER.map(def => {
-            const c = criteria[def.id];
-            if (!c) return null;
-            const showTier = def.tier !== lastTier;
-            lastTier = def.tier;
-            const scoreKey = (c.score === null || c.score === undefined) ? null : c.score;
-            const isNull   = scoreKey === null;
-            const srcKey   = c.source || 'none';
-            return (
-              <React.Fragment key={def.id}>
-                {showTier && (
-                  <div className="pt-4 pb-1.5 text-[9px] font-bold text-gray-400 uppercase tracking-widest">
-                    {TIER_LABEL[def.tier]}
-                  </div>
-                )}
-                <div className={`flex items-start gap-2 py-2 border-b border-gray-50 last:border-0 ${isNull ? 'opacity-60' : ''}`}>
-                  <span className={`${SCORE_CLS[scoreKey]} font-bold text-sm w-4 shrink-0 mt-px leading-tight`}>
-                    {SCORE_SYM[scoreKey]}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-[11px] font-medium text-gray-700 leading-tight flex items-center gap-1.5">
-                      {def.label}
-                      <span className={`text-[8px] px-1 py-px rounded uppercase tracking-wide ${SOURCE_CLS[srcKey] || SOURCE_CLS.none}`}>
-                        {SOURCE_LABEL[srcKey] || srcKey}
-                      </span>
-                    </div>
-                    <div className="text-[10px] text-gray-400 leading-snug mt-0.5">{c.note}</div>
-                  </div>
-                  <span className="text-[10px] text-gray-300 mono shrink-0">
-                    {isNull ? 'n/a' : `${c.score * def.weight}/${def.weight * 2}`}
-                  </span>
-                </div>
-              </React.Fragment>
-            );
-          })}
-        </div>
+        <button
+          onClick={() => setExpanded(e => !e)}
+          className="w-full text-[11px] text-gray-400 hover:text-gray-700 transition-colors pt-2 mt-2 border-t border-gray-50">
+          {expanded ? '▲ Hide breakdown' : '▼ Show full breakdown'}
+        </button>
 
-        {/* Grounding citations — what the AI half actually read */}
-        {sources.length > 0 && (
-          <div className="pt-4">
-            <div className="text-[9px] font-bold text-gray-400 uppercase tracking-widest pb-1.5">Sources</div>
-            <div className="flex flex-wrap gap-1">
-              {sources.map((s, i) => (
-                <a key={i} href={s} target="_blank" rel="noopener noreferrer"
-                   className="text-[9px] text-blue-500 hover:text-blue-700 bg-blue-50 rounded px-1.5 py-0.5 truncate max-w-[46%]">
-                  {(() => { try { return new URL(s).hostname.replace(/^www\./, ''); } catch { return s; } })()}
-                </a>
-              ))}
-            </div>
+        {expanded && (
+          <div className="pt-1">
+            <ScoreBreakdown data={data} />
+            {user && (
+              <button onClick={handleDelete}
+                className="w-full mt-2 text-[11px] text-red-300 hover:text-red-500 transition-colors py-2 border-t border-gray-50">
+                Delete analysis
+              </button>
+            )}
           </div>
-        )}
-
-        <div className="pt-4 text-[10px] text-gray-300 text-center">
-          Scored {data.scored_at} · {data.sector} · {data.industry}
-        </div>
-
-        {user && (
-          <button
-            onClick={() => onDelete(data.ticker)}
-            className="w-full mt-3 text-xs text-red-300 hover:text-red-500 transition-colors py-2 border-t border-gray-50"
-          >
-            Delete analysis
-          </button>
         )}
       </div>
     </div>
