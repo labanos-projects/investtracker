@@ -67,20 +67,20 @@ require_once __DIR__ . '/auth_check.php';
 
 switch ($method) {
 
-    // ── GET /notes.php?ticker=AAPL&portfolio_id=X ──────────────────────────
+    // ── GET /notes.php?ticker=AAPL ─────────────────────────────────────────
+    // Notes are TICKER-scoped, not portfolio-scoped. portfolio_id is still
+    // written (audit) but is no longer a read filter — the same decision
+    // already made for valuation_models. The merged ticker page can be opened
+    // from the screener or a watchlist, where there is no portfolio at all; if
+    // reads stayed portfolio-scoped, a note written from the screener would be
+    // invisible on the holding for the same company, which is worse than two
+    // portfolios holding the same ticker sharing a diary.
+    //
+    // ?portfolio_id= is accepted and ignored, so old clients keep working.
     case 'GET':
-        $pfId = (int)($_GET['portfolio_id'] ?? 0);
-        if ($ticker && $pfId) {
+        if ($ticker) {
             $stmt = $pdo->prepare("
-                SELECT id, ticker, DATE_FORMAT(date,'%Y-%m-%d') AS date, text
-                FROM investment_notes
-                WHERE ticker = ? AND portfolio_id = ?
-                ORDER BY date DESC, id DESC
-            ");
-            $stmt->execute([$ticker, $pfId]);
-        } elseif ($ticker) {
-            $stmt = $pdo->prepare("
-                SELECT id, ticker, DATE_FORMAT(date,'%Y-%m-%d') AS date, text
+                SELECT id, ticker, portfolio_id, DATE_FORMAT(date,'%Y-%m-%d') AS date, text
                 FROM investment_notes
                 WHERE ticker = ?
                 ORDER BY date DESC, id DESC
@@ -88,13 +88,13 @@ switch ($method) {
             $stmt->execute([$ticker]);
         } else {
             $stmt = $pdo->query("
-                SELECT id, ticker, DATE_FORMAT(date,'%Y-%m-%d') AS date, text
+                SELECT id, ticker, portfolio_id, DATE_FORMAT(date,'%Y-%m-%d') AS date, text
                 FROM investment_notes
                 ORDER BY date DESC, id DESC
             ");
         }
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        foreach ($rows as &$r) { $r['id'] = (int)$r['id']; }
+        foreach ($rows as &$r) { $r['id'] = (int)$r['id']; $r['portfolio_id'] = (int)$r['portfolio_id']; }
         echo json_encode($rows);
         break;
 
@@ -106,9 +106,11 @@ switch ($method) {
         $date = trim($body['date']   ?? '');
         $text = trim($body['text']   ?? '');
 
-        if (!$pfId || !$t || !$date || !$text) {
+        // portfolio_id 0 is legitimate: a note on a company you don't own yet,
+        // written from the screener or a watchlist.
+        if (!$t || !$date || !$text) {
             http_response_code(400);
-            echo json_encode(['error' => 'portfolio_id, ticker, date and text are required']);
+            echo json_encode(['error' => 'ticker, date and text are required']);
             exit;
         }
 

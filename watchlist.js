@@ -10,17 +10,28 @@
 // Wired into App in app.js via the view='watchlist' branch.
 
 // ─── WatchlistAddModal ────────────────────────────────────────────────────
-function WatchlistAddModal({ watchlistId, onClose, onAdded }) {
+// `prefill` is passed by TickerPage: you are already looking at the company, so
+// re-typing its name into a search box is pure friction. When it is present the
+// search step is skipped entirely and the form opens ready to save.
+function WatchlistAddModal({ watchlistId, watchlists, prefill, onClose, onAdded }) {
   const { useState, useEffect, useRef } = React;
 
   const [query,    setQuery]    = useState('');
   const [results,  setResults]  = useState([]);
   const [searching, setSearching] = useState(false);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState(prefill ? { symbol: prefill.yhTicker } : null);
   const debounceRef = useRef(null);
 
+  // With several watchlists, "add to watchlist" from a ticker page is ambiguous
+  // — offer the choice rather than silently picking the active one.
+  const [targetWl, setTargetWl] = useState(watchlistId);
+  useEffect(() => { setTargetWl(watchlistId); }, [watchlistId]);
+
   const [form, setForm] = useState({
-    ticker: '', yhTicker: '', company: '', ccy: 'USD',
+    ticker:   prefill?.ticker   || '',
+    yhTicker: prefill?.yhTicker || '',
+    company:  prefill?.company  || '',
+    ccy:      prefill?.ccy      || 'USD',
     target_price: '', note: '',
   });
   const [saving, setSaving] = useState(false);
@@ -67,7 +78,7 @@ function WatchlistAddModal({ watchlistId, onClose, onAdded }) {
       const res = await fetch(WATCHLIST_ITEMS_API, {
         method: 'POST', headers: authHeaders(),
         body: JSON.stringify({
-          watchlist_id: watchlistId,
+          watchlist_id: targetWl,
           ticker,
           yhTicker: form.yhTicker.trim() || ticker,
           company:  form.company.trim(),
@@ -98,7 +109,25 @@ function WatchlistAddModal({ watchlistId, onClose, onAdded }) {
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
         </div>
 
-        {/* Ticker search */}
+        {/* Which watchlist — only worth asking when there is more than one */}
+        {prefill && Array.isArray(watchlists) && watchlists.length > 1 && (
+          <div className="mb-4">
+            <label className="text-[10px] text-gray-400 uppercase tracking-wide block mb-0.5">Watchlist</label>
+            <select value={targetWl || ''} onChange={e => setTargetWl(parseInt(e.target.value))}
+              className="w-full text-[13px] border border-gray-200 rounded-lg px-3 py-2 outline-none focus:border-blue-300 bg-white">
+              {watchlists.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+            </select>
+          </div>
+        )}
+
+        {/* Ticker search — skipped entirely when the company is already known */}
+        {prefill ? (
+          <div className="mb-4 flex items-center gap-1.5 text-[12px] text-blue-600 bg-blue-50 px-2.5 py-2 rounded-lg">
+            <span className="font-semibold mono">{form.yhTicker || form.ticker}</span>
+            <span className="text-gray-400">·</span>
+            <span className="truncate">{form.company}</span>
+          </div>
+        ) : (
         <div className="mb-4 relative">
           <label className="text-[10px] text-gray-400 uppercase tracking-wide block mb-0.5">Search Ticker</label>
           <div className="relative">
@@ -129,6 +158,7 @@ function WatchlistAddModal({ watchlistId, onClose, onAdded }) {
             </div>
           )}
         </div>
+        )}
 
         {/* Manual edit fields (pre-filled by ticker search) */}
         <div className="border-t border-gray-100 pt-3 mb-3">
@@ -191,7 +221,10 @@ function WatchlistAddModal({ watchlistId, onClose, onAdded }) {
 }
 
 // ─── WatchlistItemRow ─────────────────────────────────────────────────────
-function WatchlistItemRow({ item, price, onSave, onDelete, user, onRequireLogin }) {
+// The row keeps its inline target/note editor on click — that is the whole
+// point of a watchlist — so opening the company page hangs off the ticker cell
+// and a link in the expanded drawer, rather than stealing the row click.
+function WatchlistItemRow({ item, price, onSave, onDelete, onOpen, user, onRequireLogin }) {
   const { useState } = React;
   const [expanded, setExpanded] = useState(false);
   const [editTarget, setEditTarget] = useState(item.target_price ?? '');
@@ -232,8 +265,21 @@ function WatchlistItemRow({ item, price, onSave, onDelete, user, onRequireLogin 
       <tr onClick={() => setExpanded(e => !e)}
         className="border-b border-gray-100 cursor-pointer transition-colors bg-white hover:bg-blue-50">
         <td className="px-4 py-2.5 min-w-[110px]">
-          <div className="font-semibold text-gray-900 text-[13px]">{item.ticker}</div>
-          <div className="text-[11px] text-gray-400 truncate max-w-[140px]">{item.company}</div>
+          {onOpen ? (
+            <button onClick={e => { e.stopPropagation(); onOpen(); }}
+              title={`Open ${item.ticker}`}
+              className="text-left group">
+              <div className="font-semibold text-[13px] text-gray-900 group-hover:text-blue-600 group-hover:underline transition-colors">
+                {item.ticker}
+              </div>
+              <div className="text-[11px] text-gray-400 truncate max-w-[140px]">{item.company}</div>
+            </button>
+          ) : (
+            <>
+              <div className="font-semibold text-gray-900 text-[13px]">{item.ticker}</div>
+              <div className="text-[11px] text-gray-400 truncate max-w-[140px]">{item.company}</div>
+            </>
+          )}
         </td>
         <td className="px-3 py-2.5 text-right mono">
           {price?.price != null ? (
@@ -282,11 +328,19 @@ function WatchlistItemRow({ item, price, onSave, onDelete, user, onRequireLogin 
               </div>
             </div>
             <div className="flex items-center justify-between mt-2">
-              <button onClick={e => { e.stopPropagation(); user ? handleDelete() : onRequireLogin(handleDelete); }}
-                disabled={saving}
-                className="text-[11px] text-red-400 hover:text-red-600 px-2 py-1 rounded-md hover:bg-red-50 transition-colors">
-                Remove
-              </button>
+              <div className="flex items-center gap-1">
+                <button onClick={e => { e.stopPropagation(); user ? handleDelete() : onRequireLogin(handleDelete); }}
+                  disabled={saving}
+                  className="text-[11px] text-red-400 hover:text-red-600 px-2 py-1 rounded-md hover:bg-red-50 transition-colors">
+                  Remove
+                </button>
+                {onOpen && (
+                  <button onClick={e => { e.stopPropagation(); onOpen(); }}
+                    className="text-[11px] text-blue-500 hover:text-blue-700 px-2 py-1 rounded-md hover:bg-blue-50 transition-colors">
+                    Open ticker page →
+                  </button>
+                )}
+              </div>
               <div className="flex gap-2">
                 <button onClick={e => { e.stopPropagation(); setExpanded(false); setEditTarget(item.target_price ?? ''); setEditNote(item.note ?? ''); }}
                   className="text-[12px] text-gray-400 hover:text-gray-600 px-3 py-1 rounded-lg hover:bg-gray-100 transition-colors">
@@ -317,6 +371,7 @@ function WatchlistView({
   user, onRequireLogin,
   watchlists, watchlistId, onSwitchWatchlist,
   showAddModal, setShowAddModal,
+  onOpenTicker,
 }) {
   const { useState, useEffect, useCallback } = React;
   const [items,   setItems]   = useState([]);
@@ -379,6 +434,21 @@ function WatchlistView({
     if (!res.ok) { alert('Could not remove'); return; }
     setItems(prev => prev.filter(it => it.id !== id));
   }, []);
+
+  // A watchlist row is a company you are researching, so it opens the same
+  // TickerPage as a holding or a screener result. `origin` only sets the back
+  // button label, so you return to the watchlist you came from.
+  const openTicker = useCallback((it) => {
+    if (!onOpenTicker) return;
+    onOpenTicker({
+      ticker:   it.ticker,
+      yhTicker: it.yh_ticker || it.ticker,
+      company:  it.company || null,
+      ccy:      it.ccy || null,
+      sector:   it.sector || null,
+      origin:   'watchlist',
+    });
+  }, [onOpenTicker]);
 
   const activeWl = watchlists.find(w => w.id === watchlistId);
 
@@ -447,6 +517,7 @@ function WatchlistView({
                   price={prices[it.yh_ticker]}
                   onSave={handleSave}
                   onDelete={handleDelete}
+                  onOpen={onOpenTicker ? () => openTicker(it) : null}
                   user={user}
                   onRequireLogin={onRequireLogin}
                 />

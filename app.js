@@ -1,4 +1,4 @@
-// ─── App ─────────────────────────────────────────────────────────────────────────────
+// ─── App ────────────────────────────────────────────────────────────────
 function App() {
   const [prices, setPrices]           = useState({});
   const [fx, setFx]                   = useState(CACHED_FX);
@@ -9,7 +9,10 @@ function App() {
   const [sortBy, setSortBy]           = useState('value');
   const [sortDir, setSortDir]         = useState('desc');
   const [notice, setNotice]           = useState(null);
-  const [selectedTicker, setSelectedTicker] = useState(null);
+  // A single route for the shared company page. Holdings, Watchlist and
+  // Screener all open the same TickerPage; `origin` only decides the label on
+  // the back button, so returning lands you on the tab you came from.
+  const [tickerCtx, setTickerCtx] = useState(null);
   const [showClosed,    setShowClosed]    = useState(false);
   const [showAddModal,  setShowAddModal]  = useState(false);
   const [showInsights,  setShowInsights]  = useState(false);
@@ -36,7 +39,7 @@ function App() {
   const [showLogin,    setShowLogin]    = useState(false);
   const [pendingAction, setPendingAction] = useState(null);
 
-  // ── Portfolio from DB ────────────────────────────────────────────────────────────────
+  // ── Portfolio from DB ───────────────────────────────────────────────────────
   const portfolioRef = React.useRef([]);
   const [portfolio,       setPortfolio]       = useState([]);
   const [portfolioLoaded, setPortfolioLoaded] = useState(false);
@@ -195,8 +198,13 @@ function App() {
     setTxnsLoaded(false);
     setPrices({});
     setIsLive(false);
-    setSelectedTicker(null);
+    setTickerCtx(null);
     portfolioRef.current = [];
+  }, []);
+
+  const openTicker = useCallback((ctx) => {
+    setTickerCtx(ctx);
+    window.scrollTo(0, 0);
   }, []);
 
   const requireLogin = useCallback((action) => {
@@ -237,7 +245,7 @@ function App() {
     setUser(null);
   }, []);
 
-  // ── Transactions from DB ────────────────────────────────────────────────────────────────
+  // ── Transactions from DB ───────────────────────────────────────────────────────
   const [allTxns,    setAllTxns]    = useState({});
   const [txnsLoaded, setTxnsLoaded] = useState(false);
 
@@ -265,7 +273,7 @@ function App() {
       return next;
     });
     setAllTxns(prev => { const next = { ...prev }; delete next[ticker]; return next; });
-    setSelectedTicker(null);
+    setTickerCtx(null);
   }, []);
 
   const handlePortfolioChanged = useCallback((newPfItem, firstTxn) => {
@@ -382,18 +390,43 @@ function App() {
   const activePositions = withWeight.filter(p => p.shares > 0);
   const closedPositions = withWeight.filter(p => p.shares === 0);
 
-  if (selectedTicker) {
-    const pos = withWeight.find(p => p.ticker === selectedTicker);
-    if (pos) return (
-      <DetailPage
+  // The company page renders for any ticker — held or not. A holding is looked
+  // up by ticker and passed as `position`; when there is none the page falls
+  // back to its own ?quote= snapshot instead of refusing to open.
+  if (tickerCtx) {
+    // Opened from the screener, `ticker` is a Yahoo symbol (NOVO-B.CO); the
+    // holding is stored under the internal ticker (NOVO-B). Matching on only
+    // one of them showed "not held" for companies actually in the portfolio.
+    const norm  = v => (v || '').toUpperCase();
+    const strip = v => norm(v).replace(/\.[A-Z]{1,3}$/, '');
+    const pos = withWeight.find(p =>
+      norm(p.ticker) === norm(tickerCtx.ticker) ||
+      norm(p.yhTicker) === norm(tickerCtx.yhTicker) ||
+      strip(p.yhTicker) === strip(tickerCtx.yhTicker || tickerCtx.ticker)
+    ) || null;
+    // When it IS a holding, the holding's own identifiers win, so notes and
+    // valuations resolve to the same keys the portfolio view has always used.
+    const ctx = pos
+      ? { ...tickerCtx, ticker: pos.ticker, yhTicker: pos.yhTicker, company: pos.company || tickerCtx.company, ccy: pos.ccy }
+      : tickerCtx;
+    const backLabel = tickerCtx.origin === 'screener'  ? 'Screener'
+                    : tickerCtx.origin === 'watchlist' ? 'Watchlist'
+                    :                                    'Portfolio';
+    return (
+      <TickerPage
+        ctx={ctx}
         position={pos}
-        initialTxns={(allTxns[selectedTicker] || []).slice().sort((a,b) => b.date.localeCompare(a.date) || b.id - a.id)}
-        onBack={() => setSelectedTicker(null)}
+        initialTxns={(allTxns[ctx.ticker] || []).slice().sort((a,b) => b.date.localeCompare(a.date) || b.id - a.id)}
+        onBack={() => setTickerCtx(null)}
+        backLabel={backLabel}
         onTxnsChanged={handleTxnsChanged}
         onRemoveHolding={handleRemoveHolding}
+        onAddedHolding={handlePortfolioChanged}
         user={user}
         onRequireLogin={requireLogin}
         portfolioId={portfolioId}
+        watchlists={watchlists}
+        watchlistId={watchlistId}
         isLive={isLive}
         lastUpdated={lastUpdated}
         baseCcy={baseCcy}
@@ -560,13 +593,14 @@ function App() {
             onSwitchWatchlist={switchWatchlist}
             showAddModal={showAddModal}
             setShowAddModal={setShowAddModal}
+            onOpenTicker={openTicker}
           />
         )
       )}
 
       {/* ── Screener view ── */}
       {view === 'screener' && (
-        <ScreenerView user={user} onRequireLogin={requireLogin} />
+        <ScreenerView user={user} onRequireLogin={requireLogin} onOpenTicker={openTicker} />
       )}
 
       {/* ── Portfolio view ── */}
@@ -672,7 +706,7 @@ function App() {
                   </thead>
                   <tbody>
                     {sortedActive.map((p, i) => (
-                      <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)} className={`border-b border-gray-100 cursor-pointer transition-colors ${i%2===0 ? 'bg-white hover:bg-blue-50' : 'bg-gray-50/60 hover:bg-blue-50'}`}>
+                      <tr key={p.ticker} onClick={() => openTicker({ ...p, origin: 'portfolio' })} className={`border-b border-gray-100 cursor-pointer transition-colors ${i%2===0 ? 'bg-white hover:bg-blue-50' : 'bg-gray-50/60 hover:bg-blue-50'}`}>
                         <td className="px-4 py-2.5 min-w-[110px]">
                           <div className="font-semibold text-gray-900 text-[13px]">{p.ticker}</div>
                           <div className="text-[11px] text-gray-400 truncate max-w-[110px]">{p.company}</div>
@@ -710,7 +744,7 @@ function App() {
                     )}
 
                     {showClosed && sortedClosed.map((p) => (
-                      <tr key={p.ticker} onClick={() => setSelectedTicker(p.ticker)}
+                      <tr key={p.ticker} onClick={() => openTicker({ ...p, origin: 'portfolio' })}
                         className="border-b border-gray-50 cursor-pointer bg-gray-50/30 hover:bg-blue-50 opacity-50">
                         <td className="px-4 py-2.5 min-w-[110px]">
                           <div className="flex items-center gap-1.5">
