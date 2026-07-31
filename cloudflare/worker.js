@@ -7,7 +7,10 @@
 // v12 – screener upstreams cached; ?refresh=1 bypasses every layer.
 // v13 – screener: verify the token before scoring, and report whether the
 //       result actually persisted instead of swallowing the failure.
+// v14 – add ?quote= : the full ticker snapshot the shared company page needs
+//       for a symbol with no row in `portfolio`.
 import { scoreTicker } from './screener_score.js';
+import { yahooSummary } from './screener_data.js';
 
 export default {
   async fetch(request, env) {
@@ -119,6 +122,56 @@ export default {
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
       }
+    }
+
+    // ── Ticker snapshot: ?quote=SYMBOL ────────────────────────────────────────────────────
+    // Everything the shared ticker page needs for a company that has no row in
+    // `portfolio`: currency, name, sector, market cap, P/E. Without this the
+    // page renders four dashes for every un-held symbol, which is exactly the
+    // case the merged page exists to serve.
+    //
+    // Two independent sources, deliberately:
+    //   price + chgPct  ← the chart series. quoteSummary's
+    //                     regularMarketChangePercent goes stale intraday; this
+    //                     is the same reconstruction ?symbols= already does.
+    //   fundamentals    ← yahooSummary(), which owns the crumb handshake and
+    //                     the 15-minute cache the screener already warms, so a
+    //                     ticker page costs nothing extra once it is hot.
+    //
+    // Either half can fail alone, so we only 404 when NEITHER answered. A dead
+    // quoteSummary still leaves a priced chart rather than a blank page, and
+    // `summary_ok: false` distinguishes "upstream broke" from "no such data".
+    const quoteSym = url.searchParams.get('quote');
+    if (quoteSym) {
+      const refreshQuote = url.searchParams.get('refresh') === '1';
+      const [seriesSettled, summarySettled] = await Promise.allSettled([
+        chartSnapshot(quoteSym),
+        yahooSummary(quoteSym, refreshQuote),
+      ]);
+      const series  = seriesSettled.status  === 'fulfilled' ? seriesSettled.value  : null;
+      const summary = summarySettled.status === 'fulfilled' ? summarySettled.value : null;
+
+      if (!series && !summary) {
+        return new Response(JSON.stringify({ error: `No data for ${quoteSym}` }), {
+          status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
+      return new Response(JSON.stringify({
+        symbol:       quoteSym,
+        price:        series?.price ?? summary?.price ?? null,
+        chgPct:       series?.chgPct ?? null,
+        currency:     summary?.currency ?? series?.currency ?? null,
+        company:      summary?.longName ?? null,
+        sector:       summary?.sector ?? null,
+        industry:     summary?.industry ?? null,
+        mktcap:       summary?.mktcap_native ?? null,
+        pe:           summary?.pe_trailing ?? null,
+        gross_margin: summary?.gross_margin ?? null,
+        payout_ratio: summary?.payout_ratio ?? null,
+        insider_own:  summary?.insider_own ?? null,
+        summary_ok:   !!summary,
+      }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
     }
 
     // ── News endpoint ─────────────────────────────────────────────────────────────────────
@@ -324,6 +377,64 @@ export default {
     return new Response(JSON.stringify({ quoteResponse: { result: results.filter(Boolean), error: null } }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
   },
 };
+
+// ── Chart-derived price and today's change ──────────────────────────────────────────────────
+// Yahoo's regularMarketChangePercent goes stale intraday, so the change is
+// rebuilt from the 5-day/5-minute series: walk back to the most recent close
+// that is not today in Copenhagen time and treat that as the previous close.
+// This is the ?symbols= logic, lifted to module scope so ?quote= can reuse it —
+// the helpers inside the ?symbols= block are `const` and therefore unreachable
+// from a handler that runs earlier in the same function.
+//
+// Returns chgPct as a FRACTION (0.0134), not a percentage. The frontend's pct()
+// multiplies by 100, which is why app.js divides the ?symbols= value by 100.
+async function chartSnapshot(symbol) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
+    const res   = await fetch(yfUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://finance.yahoo.com/',
+      },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    const data   = await res.json();
+    const result = data?.chart?.result?.[0];
+    const meta   = result?.meta;
+    if (!meta) return null;
+
+    const timestamps = result.timestamp ?? [];
+    const closes     = result.indicators?.quote?.[0]?.close ?? [];
+
+    // Thinly traded names can have a null final candle; fall back to the last
+    // close that exists rather than reporting no price at all.
+    let last = null;
+    for (let i = closes.length - 1; i >= 0; i--) { if (closes[i] != null) { last = closes[i]; break; } }
+    const price = meta.regularMarketPrice ?? last ?? null;
+
+    const fmt   = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
+    const today = fmt.format(new Date());
+    let prevClose = null;
+    for (let i = timestamps.length - 1; i >= 0; i--) {
+      if (closes[i] != null && fmt.format(new Date(timestamps[i] * 1000)) !== today) { prevClose = closes[i]; break; }
+    }
+    prevClose = prevClose ?? meta.chartPreviousClose ?? meta.previousClose ?? null;
+
+    return {
+      price,
+      chgPct:   (prevClose && price != null) ? (price - prevClose) / prevClose : null,
+      currency: meta.currency ?? null,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // ── Gemini prompt builders ──────────────────────────────────────────────────────────────────
 function buildValuationPrompt(symbol, stmts, currentPrice, currency, today) {
