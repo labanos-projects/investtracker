@@ -59,6 +59,7 @@ Notes:
 - `summary_ok: false` means the quoteSummary call failed — the fundamentals are
   missing because of an upstream error, not because the company has none.
 - 404 only when *neither* source answered.
+- `&refresh=1` bypasses the summary cache, the same way the screener's does.
 
 ### `?chart=SYMBOL&range=RANGE` — Historical chart data
 Returns OHLC close prices for charting.
