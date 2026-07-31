@@ -21,9 +21,11 @@ Three independently deployed components:
 [ Browser ]
     │
     ├─→ GitHub Pages (tracker.labanos.dk)
-    │     index.html  ← React SPA (no build step, Babel in-browser)
-    │     chart.js    ← StockChart + PortfolioChart components
-    │     screener.js ← ScreenerView + ScoreCard + ScoreDetail
+    │     index.html   ← React SPA shell (no build step, Babel in-browser)
+    │     app.js       ← App: state, routing, price/FX fetching
+    │     ticker.js    ← TickerPage — the ONE company page (see below)
+    │     chart.js     ← StockChart + PortfolioChart components
+    │     screener.js  ← ScreenerView + ScoreCard + ScoreBreakdown + ScoreBlock
     │
     ├─→ Cloudflare Worker (yf-proxy.labanos.workers.dev)
     │     Proxies all Yahoo Finance API calls
@@ -57,9 +59,20 @@ Three independently deployed components:
 ```
 /
 ├── CLAUDE.md               # This file — canonical agent context
-├── index.html              # React SPA entry point
+├── index.html              # React SPA shell — loads every script below, in order
+├── constants.js            # API URLs, formatters, CACHED_FX, computePosition
+├── components.js           # Shared UI: forms, modals, login, portfolio switcher
+├── app.js                  # App — state, view routing, price/FX fetching
+├── ticker.js               # TickerPage — the shared company page
 ├── chart.js                # StockChart + PortfolioChart React components
-├── screener.js             # Screener UI (ScreenerView, ScoreCard, ScoreDetail)
+├── insights.js             # PieChart + InsightsPanel (portfolio allocation)
+├── valuations.js           # NewsPanel + ValuationPanel (DCF model UI)
+├── watchlist.js            # WatchlistView, WatchlistItemRow, WatchlistAddModal
+├── screener.js             # ScreenerView, ScoreCard, ScoreBreakdown, ScoreBlock
+├── detail.js               # DEAD — superseded by ticker.js, not loaded by
+│                           # index.html. Carries stale copies of PieChart and
+│                           # InsightsPanel that would collide with insights.js
+│                           # if anything ever loaded both. Delete on sight.
 ├── CNAME                   # tracker.labanos.dk
 ├── upload_valuation.py     # CLI script to seed valuation models into the DB
 │
@@ -97,6 +110,43 @@ Three independently deployed components:
         ├── bug_report.md
         └── feature_request.md
 ```
+
+## The shared ticker page (`ticker.js`)
+
+There is exactly **one** company page, `TickerPage`, and Holdings, Watchlist and
+Screener all open it. Before this, the rich view (chart, news, valuation, notes)
+existed only for tickers you already owned and the screener had a parallel
+score-only page — so the research view was unavailable precisely when you were
+researching, i.e. before buying.
+
+Sections render on what **exists** for the ticker, not on which tab you arrived
+from:
+
+| Condition | Section |
+|---|---|
+| `position` present | position stats, transactions, remove-holding |
+| screener result exists | score block (otherwise an offer to score) |
+| always | quote header, chart, valuation model, news, notes |
+
+### One route, three origins
+App holds a single `tickerCtx`. `origin` (`portfolio` / `watchlist` /
+`screener`) *only* sets the back-button label, so you return to the tab you came
+from. Every caller goes through `openTicker(ctx)`.
+
+### Ticker identity: two symbols for one company
+Holdings key on the **internal** ticker (`NOVO-B`); the screener and Yahoo key
+on the **exchange** symbol (`NOVO-B.CO`). App matches a `tickerCtx` against
+holdings on ticker, yhTicker, *and* suffix-stripped yhTicker — matching on only
+one showed "not held" for companies actually in the portfolio. When a holding
+does match, the **holding's** identifiers win, so notes and valuations resolve
+to the keys the portfolio view has always used.
+
+### Notes and valuations are ticker-scoped, not portfolio-scoped
+`notes.php` GET filters on ticker alone (`?portfolio_id=` is accepted and
+ignored, so old clients keep working), and POST accepts `portfolio_id: 0`. A
+note written from the screener on a company you don't own yet must still be
+there when it later becomes a holding. `valuation_models` already worked this
+way — unique on `(ticker, model_date)`, `portfolio_id` for audit only.
 
 ## Screener (v12)
 
@@ -375,6 +425,7 @@ All endpoints return JSON. Write operations require `Authorization: Bearer <user
 | Query Param | Description |
 |---|---|
 | `?symbols=AAPL,NVDA,NOVO-B.CO` | Batch real-time prices |
+| `?quote=NVDA` | Full ticker snapshot for the ticker page: price, chgPct, currency, company, sector, industry, market cap, P/E |
 | `?chart=AAPL&range=1y` | Historical chart data |
 | `?search=novo nordisk` | Ticker autocomplete |
 | `?news=AAPL` | Latest news headlines |
@@ -405,7 +456,10 @@ Triggered on **any change under `cloudflare/**`**:
 > If you add a file under `cloudflare/`, the glob already covers it.
 
 ### Frontend
-`index.html`, `chart.js` and `screener.js` are served directly from GitHub Pages — no build step.
+All frontend files (`index.html` and every `*.js` at the repo root) are served
+directly from GitHub Pages — no build step. Adding a new `.js` file means adding
+a `<script type="text/babel" src="...">` tag to `index.html`; nothing else picks
+it up.
 
 ### GitHub Secrets required
 
@@ -497,6 +551,13 @@ screener therefore does a **grounded research pass** (prose + citations) then
 an **ungrounded structuring pass** (strict `responseSchema`). Gemini 3 models
 allow both in one call — see `MODEL` in `screener_score.js`.
 
+### `chgPct` is a fraction on the frontend, a percentage from `?symbols=`
+`?symbols=` returns `regularMarketChangePercent` as a percentage (1.34) and
+`app.js` divides by 100 on arrival, because `pct()` in `constants.js` multiplies
+by 100. `?quote=` therefore returns `chgPct` **already as a fraction** (0.0134)
+— it is consumed directly, with no division. Getting this wrong is a silent
+100× error in the "Today" figure, not a crash.
+
 ### Yahoo Finance timestamps are in Unix seconds
 Normalize: `t < 1e12 ? t * 1000 : t`. Both `StockChart` and `PortfolioChart` apply this fix.
 
@@ -556,6 +617,17 @@ When the GitHub MCP is available, use it directly — no cloning needed:
 - Issues: `list_issues` / `get_issue`
 
 Only fall back to `git clone` if the MCP is unavailable. In that case, use the PAT from `~/.claude/CLAUDE.md`. **Never commit a token** — GitHub push protection blocks it and the token becomes compromised.
+
+**The MCP cannot delete files.** `create_or_update_file` and `push_files` both
+require `content` as a string; there is no delete tool and no `sha: null` escape
+hatch. A change that removes a file therefore cannot ship through the MCP alone —
+it needs real git credentials, or the file has to be removed by hand in the web
+UI. Plan for this *before* building a branch that deletes something.
+
+**Whole-file writes are the only option**, so an MCP edit means re-sending the
+entire file. Verify afterwards with `git hash-object <file>` against the `sha`
+the API returns — they are both git blob SHA-1, so a match proves the content is
+byte-identical and a mistyped file cannot ship silently.
 
 ### Verify against production, not against the diff
 The four screener bugs fixed in v11/v12 all looked correct in review. Three of
