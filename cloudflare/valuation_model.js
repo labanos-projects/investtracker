@@ -189,20 +189,32 @@ async function structure(inputs, notes, env, peRange) {
   const om0 = y0.op_income && y0.revenue ? (y0.op_income / y0.revenue) : null;
   const pe = inputs.pe_trailing ?? null;
 
-  // The base case exits at the company's own five-year MEDIAN multiple, not at
-  // today's.
+  // The base case exits at the LOWER of today's multiple and the company's own
+  // five-year median.
   //
-  // min(today, median) was the first instinct and it is wrong in one direction:
-  // it forbids the recovery case. Novo trades near 10x against a ~30x history,
-  // and a base case that may not re-rate above 10x cannot express the thesis
-  // that the de-rating was an overreaction. Meanwhile an expensive name gets
-  // exactly the discipline it needs, because its median sits below today.
+  // A median-only ceiling was tried and is actively dangerous. A trailing P/E is
+  // meaningless when the denominator is near zero, and plenty of good companies
+  // spend years there: ServiceNow's own five-year GAAP range came back low 91x,
+  // median 164x, high 584x — all arithmetically true, none of it a valuation
+  // anchor. Handed a 164x ceiling the model exited the base case at 154x and
+  // produced a +1000% fair value on figures that were otherwise correct.
   //
-  // The median is the honest anchor in both directions: revert to what this
-  // business has actually been worth, and say so out loud if you won't.
-  const ceiling = peRange?.median ?? pe;
+  // The objection to min() was that it forbids the recovery case — Novo trades
+  // near 10x against a ~30x history, and a base case capped at 10x cannot say
+  // the de-rating was an overreaction. That objection is weaker than it looks:
+  // a base case which holds the depressed multiple and grows earnings is the
+  // honest base case for a de-rated name, and the re-rating belongs in the BULL
+  // case, which is explicitly allowed to exceed base. Wanting the multiple to
+  // recover is a second bet, and it should be priced as one.
+  const ceiling = (pe != null && peRange?.median != null) ? Math.min(pe, peRange.median) : pe;
+
+  // A history far above today usually means the earnings base was depressed, not
+  // that the stock deserves a higher multiple. Say so, or the model reads the
+  // range as permission.
+  const historyInflated = pe != null && peRange?.median != null && peRange.median > pe * 1.5;
   const anchorText = peRange
-    ? `Observed 5-year P/E range: low ${peRange.low}x, median ${peRange.median}x, high ${peRange.high}x. Today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}.`
+    ? `Observed 5-year P/E range: low ${peRange.low}x, median ${peRange.median}x, high ${peRange.high}x. Today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}.` +
+      (historyInflated ? ` NOTE: that history sits far above today's multiple, which normally means GAAP earnings were depressed in those years rather than that the shares deserve a higher multiple. Treat the historical range as unreliable and anchor on today's.` : '')
     : `No 5-year P/E range could be established from the notes. Today's trailing P/E ${pe != null ? pe.toFixed(1) + 'x' : 'is unknown'} is therefore the only anchor you have.`;
 
   const buildRequest = (retry) => ({
@@ -447,17 +459,19 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
     flags.push('baseline_pe_diverges_from_market');
   }
 
-  // A base case exiting above the company's own five-year median is assuming a
-  // re-rating on top of five years of growth. Legal, but it should be on screen
-  // rather than buried in a distribution.
+  // A base case exiting above the ceiling is assuming a re-rating on top of five
+  // years of growth. Legal, but it should be on screen rather than buried in a
+  // distribution.
   //
   // The old threshold was `> pe_trailing * 1.5`, which is not a re-rating check
   // — it is a check for an absurdity. NOW exited at 72.5x against a trailing
   // 69.1x, a ratio of 1.05, sailed through, and contributed most of a +212%
-  // upside. Anchoring on the median instead catches that without forbidding a
-  // genuine recovery thesis on a de-rated name.
+  // upside. Must match `ceiling` in structure() or the model is told one limit
+  // and judged against another.
   const baseMult = perScenario.base?.avg_exit_multiple;
-  const multCeiling = peRange?.median ?? inputs.pe_trailing;
+  const multCeiling = (inputs.pe_trailing != null && peRange?.median != null)
+    ? Math.min(inputs.pe_trailing, peRange.median)
+    : inputs.pe_trailing;
   if (baseMult && multCeiling && baseMult > multCeiling) {
     flags.push('base_exit_multiple_above_current_pe');
   }
