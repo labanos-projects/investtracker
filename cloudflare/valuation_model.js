@@ -51,6 +51,10 @@ async function gemini(env, body) {
   const parts = d.candidates?.[0]?.content?.parts || [];
   return {
     text: parts.filter(p => !p.thought).map(p => p.text || '').join(''),
+    // MAX_TOKENS here means the JSON is truncated mid-value. Without this the
+    // caller sees only "Unterminated string in JSON at position 22419", which
+    // says nothing about why. See structure() for what that cost us.
+    finishReason: d.candidates?.[0]?.finishReason || null,
     sources: (d.candidates?.[0]?.groundingMetadata?.groundingChunks || [])
       .map(c => c.web?.uri).filter(Boolean).slice(0, 8),
   };
@@ -141,7 +145,7 @@ async function structure(inputs, notes, env) {
   const gm0 = y0.gross_profit && y0.revenue ? (y0.gross_profit / y0.revenue) : null;
   const om0 = y0.op_income && y0.revenue ? (y0.op_income / y0.revenue) : null;
 
-  const { text } = await gemini(env, {
+  const { text, finishReason } = await gemini(env, {
     contents: [{ parts: [{ text:
 `Turn the research notes below into bear/base/bull assumptions for a 5-year DCF on ${inputs.symbol}.
 
@@ -161,24 +165,55 @@ Revenue compounds at rev_growth for 5 years. Gross and operating margin move in 
 - ANCHOR THE MULTIPLES ON THE OBSERVED HISTORICAL RANGE FROM THE NOTES AND ON TODAY'S ${inputs.pe_trailing != null ? inputs.pe_trailing.toFixed(1) + 'x' : 'multiple'} — not on a multiple you remember for this company. A high-growth company should normally exit BELOW its current multiple, because growth decelerates as it scales. Only exceed today's multiple if the notes give a specific reason.
 - disc_rt: roughly 0.09 bear, 0.08 base, 0.08 bull; raise it for a genuinely riskier business.
 - mos: roughly 0.30 bear, 0.20 base, 0.15 bull.
-- rationale: one or two sentences per scenario, referencing the notes — specifically what justifies the growth rate and the exit multiple band.
+- rationale: ONE sentence, 200 characters maximum, naming what justifies the growth rate and the exit multiple band. Do not restate the notes.
+- Return the three scenario objects and nothing else. No summary, no preamble, no commentary outside the schema.
 
 ## Research notes
 ${notes}` }] }],
     generationConfig: {
       temperature: 0.1,
       responseMimeType: 'application/json',
+      // `thesis: { type: 'STRING' }` used to lead this object, unbounded. Gemini
+      // filled it with a ~22,000-character essay restating the research notes,
+      // exhausted maxOutputTokens before emitting a single scenario, and the
+      // truncated result surfaced as "Unterminated string in JSON at position
+      // 22419" — an error about the symptom, three layers from the cause.
+      //
+      // It is gone rather than capped: the prose it held is already covered by
+      // the per-scenario rationales and by `notes`, so it bought nothing and
+      // could only ever crowd out the numbers. An unbounded free-text field
+      // ahead of the payload you actually need is a latent version of this bug.
       responseSchema: {
         type: 'OBJECT',
         properties: {
-          thesis: { type: 'STRING' },
           scenarios: { type: 'ARRAY', items: { type: 'OBJECT', properties: SCENARIO_PROPS } },
         },
       },
-      maxOutputTokens: 8192,
+      // Structuring is a formatting job over notes that already exist, so
+      // thinking tokens buy nothing here and are charged against the same
+      // output budget the JSON needs.
+      thinkingConfig: { thinkingBudget: 0 },
+      maxOutputTokens: 16384,
     },
   });
-  return JSON.parse(text);
+
+  // responseMimeType should preclude code fences, but a stray one costs a whole
+  // generation to discover, so strip them before parsing rather than after.
+  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    if (finishReason === 'MAX_TOKENS') {
+      throw new Error(
+        `Gemini hit the output limit before finishing the JSON (${cleaned.length} chars). ` +
+        `The response is truncated, not malformed — something in the schema ran long.`
+      );
+    }
+    throw new Error(
+      `Gemini returned unparseable JSON (finishReason=${finishReason}, ${cleaned.length} chars): ` +
+      `${e.message}. Tail: ${cleaned.slice(-160)}`
+    );
+  }
 }
 
 // ─── Local projection, for the pre-save sanity check ─────────────────────────
@@ -350,7 +385,6 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
       `FY${y0.fiscal_year} baseline ended ${inputs.y0_period_end} (${inputs.months_since_y0}m ago). ` +
       `Price ${price} ${inputs.quote_currency || ''}, trailing P/E ` +
       `${inputs.pe_trailing != null ? inputs.pe_trailing.toFixed(1) + 'x' : 'n/a'}. ` +
-      (parsed.thesis ? `${parsed.thesis} ` : '') +
       (flags.length ? `FLAGS: ${flags.join(', ')}.` : '') + srcLine,
     data_quality: quality,
     flags,
