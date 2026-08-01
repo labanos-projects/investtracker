@@ -148,10 +148,39 @@ const SCENARIO_PROPS = {
   mos:             { type: 'NUMBER' },
   multiples: {
     type: 'ARRAY',
-    items: { type: 'OBJECT', properties: { multiple: { type: 'NUMBER' }, weight: { type: 'NUMBER' } } },
+    items: {
+      type: 'OBJECT',
+      properties: { multiple: { type: 'NUMBER' }, weight: { type: 'NUMBER' } },
+      required: ['multiple', 'weight'],
+    },
   },
   rationale: { type: 'STRING' },
 };
+
+// Nothing here was `required`, which in a responseSchema means every field is
+// optional and any of them may simply be absent. NOW came back with a bear
+// scenario carrying no `multiples` at all, and the run died on the guard that
+// catches it. Declaring the contract is cheaper than validating its absence.
+const SCENARIO_REQUIRED = [
+  'scenario', 'scenario_weight', 'rev_growth', 'tgt_gm', 'tgt_om',
+  'op_conv', 'shr_chg', 'disc_rt', 'mos', 'multiples',
+];
+
+/** What is missing or unusable in a structuring response. Empty array = good. */
+function scenarioProblems(parsed) {
+  const by = {};
+  for (const sc of (parsed?.scenarios || [])) by[String(sc.scenario || '').toLowerCase()] = sc;
+  const problems = [];
+  for (const w of ['bear', 'base', 'bull']) {
+    const sc = by[w];
+    if (!sc) { problems.push(`${w}: scenario absent`); continue; }
+    const raw = Array.isArray(sc.multiples) ? sc.multiples : [];
+    const usable = raw.filter(m => Number(m.multiple) > 0 && Number(m.weight) > 0);
+    if (!usable.length) problems.push(`${w}: ${raw.length} multiples returned, none usable`);
+    if (!(Number(sc.rev_growth) || Number(sc.rev_growth) === 0)) problems.push(`${w}: rev_growth missing`);
+  }
+  return problems;
+}
 
 /** Ungrounded structuring pass → strict JSON. Not cached. */
 async function structure(inputs, notes, env, peRange) {
@@ -176,8 +205,9 @@ async function structure(inputs, notes, env, peRange) {
     ? `Observed 5-year P/E range: low ${peRange.low}x, median ${peRange.median}x, high ${peRange.high}x. Today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}.`
     : `No 5-year P/E range could be established from the notes. Today's trailing P/E ${pe != null ? pe.toFixed(1) + 'x' : 'is unknown'} is therefore the only anchor you have.`;
 
-  const { text, finishReason } = await gemini(env, {
+  const buildRequest = (retry) => ({
     contents: [{ parts: [{ text:
+(retry ? `Your previous reply was rejected: ${retry}. Return ALL three scenarios, each with all ten multiples. \n\n` : '') +
 `Turn the research notes below into bear/base/bull assumptions for a 5-year DCF on ${inputs.symbol}.
 
 ## Baseline (FY${y0.fiscal_year}, filed — fixed, do not restate)
@@ -222,34 +252,56 @@ ${notes}` }] }],
       responseSchema: {
         type: 'OBJECT',
         properties: {
-          scenarios: { type: 'ARRAY', items: { type: 'OBJECT', properties: SCENARIO_PROPS } },
+          scenarios: {
+            type: 'ARRAY',
+            items: { type: 'OBJECT', properties: SCENARIO_PROPS, required: SCENARIO_REQUIRED },
+          },
         },
+        required: ['scenarios'],
       },
-      // Structuring is a formatting job over notes that already exist, so
-      // thinking tokens buy nothing here and are charged against the same
-      // output budget the JSON needs.
-      thinkingConfig: { thinkingBudget: 0 },
+      // thinkingConfig.thinkingBudget was 0 here, added as belt-and-braces
+      // against a truncation that `thesis` had actually caused. Removing thesis
+      // fixed the truncation; disabling thinking only made the model likelier to
+      // drop a field while juggling the three multiple rules above — which is
+      // exactly what happened to NOW's bear scenario. maxOutputTokens is
+      // generous now that no unbounded string leads the object.
       maxOutputTokens: 16384,
     },
   });
 
-  // responseMimeType should preclude code fences, but a stray one costs a whole
-  // generation to discover, so strip them before parsing rather than after.
-  const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch (e) {
-    if (finishReason === 'MAX_TOKENS') {
+  // Two attempts. The structuring pass is cheap and uncached, and losing a whole
+  // grounded research pass because one scenario came back short is a bad trade.
+  let lastProblems = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const { text, finishReason } = await gemini(env, buildRequest(attempt === 2 ? lastProblems.join('; ') : null));
+
+    // responseMimeType should preclude code fences, but a stray one costs a
+    // whole generation to discover, so strip them before parsing, not after.
+    const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      if (finishReason === 'MAX_TOKENS') {
+        throw new Error(
+          `Gemini hit the output limit before finishing the JSON (${cleaned.length} chars). ` +
+          `The response is truncated, not malformed — something in the schema ran long.`
+        );
+      }
       throw new Error(
-        `Gemini hit the output limit before finishing the JSON (${cleaned.length} chars). ` +
-        `The response is truncated, not malformed — something in the schema ran long.`
+        `Gemini returned unparseable JSON (finishReason=${finishReason}, ${cleaned.length} chars): ` +
+        `${e.message}. Tail: ${cleaned.slice(-160)}`
       );
     }
-    throw new Error(
-      `Gemini returned unparseable JSON (finishReason=${finishReason}, ${cleaned.length} chars): ` +
-      `${e.message}. Tail: ${cleaned.slice(-160)}`
-    );
+
+    lastProblems = scenarioProblems(parsed);
+    if (!lastProblems.length) return parsed;
   }
+
+  throw new Error(
+    `Gemini returned incomplete scenarios for ${inputs.symbol} after 2 attempts — ${lastProblems.join('; ')}`
+  );
 }
 
 // ─── Local projection, for the pre-save sanity check ─────────────────────────
