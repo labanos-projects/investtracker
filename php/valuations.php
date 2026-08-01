@@ -34,6 +34,9 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS valuation_models (
     model_date   DATE NOT NULL,
     currency     VARCHAR(10) NOT NULL DEFAULT 'USD',
     notes        TEXT,
+    data_quality VARCHAR(24) DEFAULT NULL,
+    flags        JSON DEFAULT NULL,
+    diagnostics  JSON DEFAULT NULL,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_ticker_date (ticker, model_date),
@@ -53,6 +56,22 @@ try {
 try {
     $pdo->exec("ALTER TABLE valuation_models ADD INDEX idx_ticker (ticker)");
 } catch (Exception $e) { /* already exists */ }
+
+// Provenance columns. Before these, how much a model could be trusted lived in
+// a parenthetical inside `notes` — "(financials from training data)" — which
+// nothing could query and the UI never showed. Thirteen of twenty-six stored
+// models were built entirely from recalled figures and looked identical to the
+// real ones.
+//   data_quality  ok | warn | blocked | legacy-unverified
+//   flags         which sanity checks fired (implausible_upside, stale baseline, ...)
+//   diagnostics   per-field sources, per-scenario FV, baseline vs market P/E, citations
+foreach ([
+    "ALTER TABLE valuation_models ADD COLUMN data_quality VARCHAR(24) DEFAULT NULL",
+    "ALTER TABLE valuation_models ADD COLUMN flags JSON DEFAULT NULL",
+    "ALTER TABLE valuation_models ADD COLUMN diagnostics JSON DEFAULT NULL",
+] as $ddl) {
+    try { $pdo->exec($ddl); } catch (Exception $e) { /* column already present */ }
+}
 
 $pdo->exec("CREATE TABLE IF NOT EXISTS valuation_actuals (
     id           INT AUTO_INCREMENT PRIMARY KEY,
@@ -130,6 +149,14 @@ if ($method === 'GET') {
         exit;
     }
 
+    // Hand the client real arrays/objects rather than JSON-in-a-string, so the
+    // UI does not have to guess whether a column has been parsed already.
+    foreach (['flags', 'diagnostics'] as $jsonCol) {
+        if (isset($model[$jsonCol]) && is_string($model[$jsonCol])) {
+            $model[$jsonCol] = json_decode($model[$jsonCol], true);
+        }
+    }
+
     $mid = (int)$model['id'];
 
     $stmt = $pdo->prepare(
@@ -174,6 +201,13 @@ if ($method === 'POST') {
     $currency  = strtoupper(trim($data['currency'] ?? 'USD'));
     $notes     = trim($data['notes'] ?? '');
 
+    // Provenance. A manual edit from the UI sends none of these, and NULL is the
+    // right answer there — it means "a human owns this model", which is a
+    // different claim from "a pipeline produced it and these checks passed".
+    $quality     = isset($data['data_quality']) ? substr(trim($data['data_quality']), 0, 24) : null;
+    $flags       = array_key_exists('flags', $data)       ? json_encode($data['flags'])       : null;
+    $diagnostics = array_key_exists('diagnostics', $data) ? json_encode($data['diagnostics']) : null;
+
     if (!$ticker) {
         http_response_code(400);
         echo json_encode(['error' => 'ticker required']);
@@ -184,11 +218,13 @@ if ($method === 'POST') {
     try {
         // Upsert model record — unique on (ticker, model_date), portfolio_id stored for audit
         $stmt = $pdo->prepare(
-            "INSERT INTO valuation_models (portfolio_id, ticker, model_date, currency, notes)
-             VALUES (?,?,?,?,?)
-             ON DUPLICATE KEY UPDATE portfolio_id=VALUES(portfolio_id), currency=VALUES(currency), notes=VALUES(notes), updated_at=NOW()"
+            "INSERT INTO valuation_models (portfolio_id, ticker, model_date, currency, notes, data_quality, flags, diagnostics)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE portfolio_id=VALUES(portfolio_id), currency=VALUES(currency), notes=VALUES(notes),
+                                     data_quality=VALUES(data_quality), flags=VALUES(flags), diagnostics=VALUES(diagnostics),
+                                     updated_at=NOW()"
         );
-        $stmt->execute([$pfId, $ticker, $modelDate, $currency, $notes]);
+        $stmt->execute([$pfId, $ticker, $modelDate, $currency, $notes, $quality, $flags, $diagnostics]);
 
         // Fetch the model id (newly inserted or existing)
         $stmt = $pdo->prepare(
