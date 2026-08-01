@@ -1,5 +1,6 @@
-# worker.js imports ./screener_{engine,data,score}.js — wrangler bundles them
-# via esbuild. Deploys are triggered by any change under cloudflare/.
+# worker.js imports ./screener_{engine,data,score}.js and ./valuation_{data,model}.js
+# — wrangler bundles them via esbuild. Deploys are triggered by any change under
+# cloudflare/, so a new module here ships without touching this file.
 name            = "yf-proxy"
 main            = "worker.js"
 compatibility_date = "2025-01-01"
