@@ -9,8 +9,23 @@
 //       result actually persisted instead of swallowing the failure.
 // v14 – add ?quote= : the full ticker snapshot the shared company page needs
 //       for a symbol with no row in `portfolio`.
+// v15 – valuation rework. The DCF used to take its history from ONE source
+//       (FMP income-statement) and, when that returned nothing, fall through to
+//       a prompt that told Gemini to model the company from training data.
+//       Thirteen of twenty-six stored models were built that way. ServiceNow
+//       carried a pre-split 201M share count against 1,034M actual, putting its
+//       implied entry P/E at 8x against a market 69x — which is where the
+//       "suspiciously cheap" fair values came from.
+//
+//       Actuals now come from filings via the screener's per-field waterfall
+//       (valuation_data.js) and Gemini supplies forward assumptions only,
+//       search-grounded (valuation_model.js). Inputs are reconciled against
+//       market cap before anything is saved, and buildKnowledgePrompt is gone:
+//       when no source answers, the endpoint now returns an error instead of an
+//       invented model.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
+import { generateValuation } from './valuation_model.js';
 
 export default {
   async fetch(request, env) {
@@ -31,6 +46,12 @@ export default {
     }
 
     // ── AI Valuation Generator ───────────────────────────────────────────────────────────
+    // Orchestration lives in valuation_model.js. The split that matters: every
+    // historical figure is resolved from filings, and Gemini's response schema
+    // has no field in which to return one, so it cannot contradict a 10-K.
+    //
+    // ?refresh=1 bypasses every cache layer, including the 24h grounded
+    // research pass — same contract as the screener.
     const genTicker = url.searchParams.get('generate_valuation');
     if (genTicker) {
       const authHeader = request.headers.get('Authorization') || '';
@@ -43,81 +64,54 @@ export default {
 
       const portfolioId  = parseInt(url.searchParams.get('portfolio_id') || '0');
       const currentPrice = parseFloat(url.searchParams.get('current_price') || '0');
+      const refresh      = url.searchParams.get('refresh') === '1';
 
       try {
-        const symbol    = genTicker.toUpperCase();
-        const fmpSymbol = symbol.replace(/\.[A-Z]{1,3}$/, '');
-        const fmpKey    = env.FMP_API_KEY;
+        const symbol = genTicker.toUpperCase().trim();
+        const result = await generateValuation(symbol, env, { currentPrice, portfolioId, refresh });
 
-        const fmpRes = await fetch(
-          `https://financialmodelingprep.com/stable/income-statement?symbol=${encodeURIComponent(fmpSymbol)}&limit=5&apikey=${fmpKey}`,
-          { headers: { 'User-Agent': 'Mozilla/5.0' } }
-        );
-        const fmpText = await fmpRes.text();
-        let fmpData = null;
-        try { fmpData = JSON.parse(fmpText); } catch (e) {}
-
-        const today = new Date().toISOString().split('T')[0];
-        let prompt;
-
-        if (Array.isArray(fmpData) && fmpData.length > 0) {
-          const annuals  = fmpData.filter(r => !r.period || r.period === 'FY').sort((a, b) => a.date.localeCompare(b.date));
-          const stmts    = annuals.slice(-3);
-          const currency = fmpData[0]?.reportedCurrency || 'USD';
-          prompt = buildValuationPrompt(symbol, stmts, currentPrice, currency, today);
-        } else {
-          prompt = buildKnowledgePrompt(symbol, currentPrice, today);
+        // Inputs failed to reconcile with the market. Refusing to save is the
+        // whole point: a model that survives this gate is wrong in its
+        // judgement, one that fails it is wrong in its arithmetic, and only the
+        // second kind is silently unrecoverable.
+        if (result.blocked) {
+          return new Response(JSON.stringify({
+            error: `Valuation blocked: ${result.message}`,
+            code: result.blocked,
+            flags: result.flags,
+            diagnostics: result.diagnostics,
+            inputs_preview: result.inputs_preview,
+          }), { status: 422, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
         }
-
-        const geminiKey = env.GEMINI_API_KEY;
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              contents: [{ parts: [{ text: prompt }] }],
-              generationConfig: { responseMimeType: 'application/json', temperature: 0.3, maxOutputTokens: 8192 },
-            }),
-          }
-        );
-
-        if (!geminiRes.ok) {
-          const errJson = await geminiRes.json().catch(() => null);
-          const errMsg  = errJson?.error?.message || 'Unknown Gemini error';
-          const errCode = errJson?.error?.code || geminiRes.status;
-          const friendly = errCode === 429
-            ? 'Gemini quota exceeded — enable billing at aistudio.google.com or wait for quota reset'
-            : `Gemini error ${errCode}: ${errMsg.slice(0, 200)}`;
-          return new Response(JSON.stringify({ error: friendly }), { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
-        }
-
-        const geminiData = await geminiRes.json();
-        const parts   = geminiData.candidates?.[0]?.content?.parts || [];
-        const rawJson = (parts.find(p => !p.thought) || parts[parts.length - 1])?.text;
-
-        if (!rawJson) {
-          return new Response(JSON.stringify({ error: 'No content from Gemini', raw: JSON.stringify(geminiData).slice(0, 400) }), { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
-        }
-
-        let payload;
-        try {
-          const cleaned = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-          payload = JSON.parse(cleaned);
-        } catch (e) {
-          return new Response(JSON.stringify({ error: 'Gemini returned invalid JSON', raw: rawJson.slice(0, 500) }), { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
-        }
-
-        payload.portfolio_id = portfolioId;
 
         const saveRes = await fetch('https://labanos.dk/valuations.php', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(result.payload),
         });
 
-        const saveData = await saveRes.json();
-        return new Response(JSON.stringify(saveData), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        // A 401/500 here is a RESOLVED fetch, not an exception. The screener
+        // learned this the hard way — every failed save vanished silently.
+        const saveText = await saveRes.text();
+        let saveData = null;
+        try { saveData = JSON.parse(saveText); } catch { /* non-JSON error page */ }
+
+        if (!saveRes.ok) {
+          return new Response(JSON.stringify({
+            error: saveData?.error || `Save failed (${saveRes.status})`,
+            persisted: false,
+            persist_status: saveRes.status,
+            diagnostics: result.diagnostics,
+          }), { status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+
+        return new Response(JSON.stringify({
+          ...(saveData || {}),
+          persisted: true,
+          data_quality: result.quality,
+          flags: result.flags,
+          diagnostics: result.diagnostics,
+        }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
 
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
@@ -434,33 +428,4 @@ async function chartSnapshot(symbol) {
   } finally {
     clearTimeout(timer);
   }
-}
-
-// ── Gemini prompt builders ──────────────────────────────────────────────────────────────────
-function buildValuationPrompt(symbol, stmts, currentPrice, currency, today) {
-  const toM = v => (v != null && v !== 0) ? Math.round(v / 1e6) : null;
-  const toMShares = v => (v != null && v !== 0) ? Math.round(v / 1e6) : null;
-
-  const rows = stmts.map(s => ({
-    year:         parseInt(s.calendarYear || s.date.slice(0, 4)),
-    revenue:      toM(s.revenue),
-    gross_profit: toM(s.grossProfit),
-    op_income:    toM(s.operatingIncome),
-    net_income:   toM(s.netIncome),
-    shares:       toMShares(s.weightedAverageShsOutDil || s.weightedAverageShsOut),
-  }));
-
-  const y2 = rows[0] || {}, y1 = rows[1] || {}, y0 = rows[2] || {};
-  const latRevGr  = (y0.revenue && y1.revenue) ? (((y0.revenue / y1.revenue) - 1) * 100).toFixed(1) + '%' : 'N/A';
-  const latGM     = (y0.revenue && y0.gross_profit) ? ((y0.gross_profit / y0.revenue) * 100).toFixed(1) + '%' : 'N/A';
-  const latOM     = (y0.revenue && y0.op_income) ? ((y0.op_income / y0.revenue) * 100).toFixed(1) + '%' : 'N/A';
-  const latNM     = (y0.revenue && y0.net_income) ? ((y0.net_income / y0.revenue) * 100).toFixed(1) + '%' : 'N/A';
-  const latOpConv = (y0.op_income && y0.net_income) ? ((y0.net_income / y0.op_income) * 100).toFixed(1) + '%' : 'N/A';
-  const histText  = rows.map(r => `  FY${r.year}: Rev=${r.revenue}M  GP=${r.gross_profit}M  EBIT=${r.op_income}M  NI=${r.net_income}M  Shares=${r.shares}M`).join('\n');
-
-  return `You are a professional equity analyst. Generate a bear/base/bull 5-year DCF valuation model for ${symbol} as a single JSON object.\n\n## Financial Data (${currency} millions, most recent 3 fiscal years)\n${histText}\n\n## Current Market Price: ${currentPrice} ${currency}  |  Date: ${today}\n\n## Key Ratios (FY${y0.year})\n- Revenue growth YoY: ${latRevGr}\n- Gross margin: ${latGM}\n- Operating margin: ${latOM}\n- Net margin: ${latNM}\n- Operating-to-net conversion: ${latOpConv}\n\n## Requirements\n- 3 scenarios: bear (pessimistic), base (realistic), bull (optimistic)\n- scenario_weight: bear=0.25, base=0.45, bull=0.30\n- proj_years: 5 for all scenarios\n- disc_rt: 0.09 for bear, 0.08 for base, 0.08 for bull\n- 10 exit P/E multiples per scenario with probability weights summing exactly to 1.0\n- mos (margin of safety): ~0.30 bear, ~0.20 base, ~0.15 bull\n- All monetary values in millions of ${currency}\n- shares = shares outstanding in millions (negative shr_chg = buybacks)\n- current_price must be ${currentPrice} in all scenarios\n\n## Output JSON Schema (return ONLY valid JSON, no markdown, no explanation)\n{\n  \"ticker\": \"${symbol}\",\n  \"model_date\": \"${today}\",\n  \"currency\": \"${currency}\",\n  \"notes\": \"AI-generated by Gemini on ${today}\",\n  \"actuals\": [\n    {\"label\":\"Y-2\",\"fiscal_year\":${y2.year || 0},\"revenue\":${y2.revenue || 0},\"gross_profit\":${y2.gross_profit || 0},\"op_income\":${y2.op_income || 0},\"net_income\":${y2.net_income || 0},\"shares\":${y2.shares || 0}},\n    {\"label\":\"Y-1\",\"fiscal_year\":${y1.year || 0},\"revenue\":${y1.revenue || 0},\"gross_profit\":${y1.gross_profit || 0},\"op_income\":${y1.op_income || 0},\"net_income\":${y1.net_income || 0},\"shares\":${y1.shares || 0}},\n    {\"label\":\"Y0\",\"fiscal_year\":${y0.year || 0},\"revenue\":${y0.revenue || 0},\"gross_profit\":${y0.gross_profit || 0},\"op_income\":${y0.op_income || 0},\"net_income\":${y0.net_income || 0},\"shares\":${y0.shares || 0}}\n  ],\n  \"scenarios\": [\n    {\"scenario\":\"bear\",\"scenario_weight\":0.25,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.09,\"mos\":0.30,\"multiples\":[{\"multiple\":<int>,\"weight\":<float>},...10 entries weight=1.0]},\n    {\"scenario\":\"base\",\"scenario_weight\":0.45,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.08,\"mos\":0.20,\"multiples\":[...10 entries weight=1.0]},\n    {\"scenario\":\"bull\",\"scenario_weight\":0.30,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.08,\"mos\":0.15,\"multiples\":[...10 entries weight=1.0]}\n  ],\n  \"history\": [\n    {\"fiscal_year\":${y2.year || 0},\"revenue\":${y2.revenue || 0},\"gross_profit\":${y2.gross_profit || 0},\"op_income\":${y2.op_income || 0},\"net_income\":${y2.net_income || 0},\"shares\":${y2.shares || 0}},\n    {\"fiscal_year\":${y1.year || 0},\"revenue\":${y1.revenue || 0},\"gross_profit\":${y1.gross_profit || 0},\"op_income\":${y1.op_income || 0},\"net_income\":${y1.net_income || 0},\"shares\":${y1.shares || 0}},\n    {\"fiscal_year\":${y0.year || 0},\"revenue\":${y0.revenue || 0},\"gross_profit\":${y0.gross_profit || 0},\"op_income\":${y0.op_income || 0},\"net_income\":${y0.net_income || 0},\"shares\":${y0.shares || 0}}\n  ]\n}`;
-}
-
-function buildKnowledgePrompt(symbol, currentPrice, today) {
-  return `You are a professional equity analyst. Generate a bear/base/bull 5-year DCF valuation model for ${symbol} as a single JSON object.\n\n## Instructions\nUse your training knowledge of ${symbol}'s publicly reported financials (most recent 3 fiscal years available to you).\nExpress all monetary values in millions of the company's reporting currency.\nThe notes field must say \"AI-generated by Gemini on ${today} (financials from training data)\".\n\n## Current Market Price: ${currentPrice}  |  Date: ${today}\n\n## Requirements\n- 3 scenarios: bear (pessimistic), base (realistic), bull (optimistic)\n- scenario_weight: bear=0.25, base=0.45, bull=0.30\n- proj_years: 5 for all scenarios\n- disc_rt: 0.09 for bear, 0.08 for base, 0.08 for bull\n- 10 exit P/E multiples per scenario with probability weights summing exactly to 1.0\n- mos (margin of safety): ~0.30 bear, ~0.20 base, ~0.15 bull\n- shares = shares outstanding in millions (negative shr_chg = buybacks)\n- current_price must be ${currentPrice} in all scenarios\n\n## Output JSON Schema (return ONLY valid JSON, no markdown, no explanation)\n{\n  \"ticker\": \"${symbol}\",\n  \"model_date\": \"${today}\",\n  \"currency\": \"<reporting currency>\",\n  \"notes\": \"AI-generated by Gemini on ${today} (financials from training data)\",\n  \"actuals\": [\n    {\"label\":\"Y-2\",\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>},\n    {\"label\":\"Y-1\",\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>},\n    {\"label\":\"Y0\",\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>}\n  ],\n  \"scenarios\": [\n    {\"scenario\":\"bear\",\"scenario_weight\":0.25,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.09,\"mos\":0.30,\"multiples\":[{\"multiple\":<int>,\"weight\":<float>},...10 entries weight=1.0]},\n    {\"scenario\":\"base\",\"scenario_weight\":0.45,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.08,\"mos\":0.20,\"multiples\":[...10 entries weight=1.0]},\n    {\"scenario\":\"bull\",\"scenario_weight\":0.30,\"current_price\":${currentPrice},\"rev_growth\":<n>,\"tgt_gm\":<n>,\"tgt_om\":<n>,\"op_conv\":<n>,\"shr_chg\":<n>,\"proj_years\":5,\"disc_rt\":0.08,\"mos\":0.15,\"multiples\":[...10 entries weight=1.0]}\n  ],\n  \"history\": [\n    {\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>},\n    {\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>},\n    {\"fiscal_year\":<int>,\"revenue\":<int>,\"gross_profit\":<int>,\"op_income\":<int>,\"net_income\":<int>,\"shares\":<int>}\n  ]\n}`;
 }
