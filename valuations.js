@@ -281,6 +281,14 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
         model_date: today,
         notes: `Model with manuel user input on ${today}`,
         portfolio_id: portfolioId,
+        // `...model` above carries the generator's provenance forward, and a
+        // hand-edited model is no longer the pipeline's claim. Without this the
+        // banner would assert filings-backed sources and passed sanity checks
+        // over figures a human has since changed by hand — which is the exact
+        // failure this provenance was added to prevent.
+        data_quality: null,
+        flags: null,
+        diagnostics: null,
       };
       const res = await fetch(VALUATIONS_API, {
         method: 'POST',
