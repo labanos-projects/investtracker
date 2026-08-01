@@ -1,4 +1,10 @@
-// ─── Valuation calculation engine ──────────────────────────────────────────
+// ─── Valuation calculation engine ─────────────────────────────────────
+//
+// NOTE: projectScenario/calcScenarioFV are mirrored server-side in
+// cloudflare/valuation_model.js, which runs the same projection BEFORE saving so
+// it can flag an implausible result. If you change the maths here, change it
+// there — a divergence shows up as a model the sanity gate approved and this
+// panel then renders differently.
 
 // Project 5-year financials for a scenario, interpolating margins from Y0 to targets.
 function projectScenario(sc, y0) {
@@ -36,7 +42,7 @@ function calcScenarioFV(sc, projRows) {
   return { fv, buyTarget: fv * (1 - Number(sc.mos || 0.20)), termEPS };
 }
 
-// ─── NewsPanel ─────────────────────────────────────────────────────────────
+// ─── NewsPanel ─────────────────────────────────────────────────────
 const NEWS_PREVIEW = 5;
 
 function NewsPanel({ yhTicker }) {
@@ -123,7 +129,124 @@ function NewsPanel({ yhTicker }) {
   );
 }
 
-// ─── ValuationPanel component ───────────────────────────────────────────────
+// ─── Model provenance ────────────────────────────────────────────────
+//
+// The panel used to render a fair value and an upside percentage with nothing
+// to say where they came from, so a model built from a language model's memory
+// was indistinguishable from one built from a 10-K. That is how ServiceNow came
+// to show a large upside off a pre-split share count for months.
+//
+// Models generated before the rework carry no `data_quality`; their only tell
+// was a parenthetical in the notes. Match it, and mark them unverified until
+// they are regenerated.
+const LEGACY_TRAINING_RE = /financials from training data/i;
+
+const FLAG_TEXT = {
+  share_count_reconciliation_failed:
+    'Reported share count could not be reconciled with market cap ÷ price.',
+  share_count_drift:
+    'Diluted shares sit more than 20% from the market-implied count — check for a split or a restatement.',
+  implausible_upside:
+    'Blended fair value is more than double the current price. Treat the upside as a hypothesis, not a finding.',
+  baseline_pe_diverges_from_market:
+    'Baseline earnings imply an entry P/E well away from the market’s trailing P/E.',
+  base_exit_multiple_above_current_pe:
+    'The base case exits above today’s multiple, so it assumes a re-rating on top of growth.',
+  baseline_year_stale:
+    'The last full fiscal year is 9+ months old — results reported since it closed are not in the baseline.',
+};
+
+function ValuationQualityBanner({ model }) {
+  const [open, setOpen] = React.useState(false);
+
+  const flags   = Array.isArray(model.flags) ? model.flags : [];
+  const diag    = (model.diagnostics && typeof model.diagnostics === 'object') ? model.diagnostics : null;
+  const legacy  = !model.data_quality && LEGACY_TRAINING_RE.test(model.notes || '');
+  const manual  = !model.data_quality && !legacy;
+
+  // A clean generated model and a hand-built one both earn silence. Only
+  // something actually worth knowing gets a banner.
+  if (!legacy && !flags.length && !diag) return null;
+  if (manual && !flags.length && !diag) return null;
+
+  const tone = (legacy || flags.length)
+    ? { box: 'bg-amber-50 border-amber-200', text: 'text-amber-800', sub: 'text-amber-700', icon: '⚠' }
+    : { box: 'bg-gray-50 border-gray-200',   text: 'text-gray-600',  sub: 'text-gray-500',  icon: '✓' };
+
+  const srcs = diag?.field_sources || {};
+  const srcLabel = Object.keys(srcs).length
+    ? Object.entries(srcs).map(([k, v]) => `${k.replace(/_/g, ' ')} ← ${v}`).join(' · ')
+    : null;
+
+  return (
+    <div className={`rounded-xl border ${tone.box} px-3 py-2 mb-2`}>
+      <div className="flex items-start gap-2">
+        <span className={`text-[12px] leading-4 ${tone.text}`}>{tone.icon}</span>
+        <div className="flex-1 min-w-0">
+          {legacy && (
+            <div className={`text-[11px] font-semibold ${tone.text}`}>
+              Unverified — built from recalled financials, not filings
+            </div>
+          )}
+          {legacy && (
+            <div className={`text-[10px] ${tone.sub} leading-relaxed mt-0.5`}>
+              This model predates the filings-backed generator. Its historical figures were
+              never checked against a 10-K. Regenerate before trusting the fair value.
+            </div>
+          )}
+
+          {flags.map(f => (
+            <div key={f} className={`text-[10px] ${tone.sub} leading-relaxed ${legacy ? 'mt-1' : ''}`}>
+              {FLAG_TEXT[f] || f}
+            </div>
+          ))}
+
+          {!legacy && !flags.length && diag && (
+            <div className={`text-[10px] ${tone.sub}`}>Actuals resolved from filings; sanity checks passed.</div>
+          )}
+
+          {diag && (
+            <button onClick={() => setOpen(o => !o)}
+              className={`text-[10px] ${tone.sub} underline underline-offset-2 hover:opacity-70 mt-1`}>
+              {open ? 'Hide provenance' : 'Show provenance'}
+            </button>
+          )}
+
+          {open && diag && (
+            <div className="mt-1.5 space-y-0.5">
+              {srcLabel && (
+                <div className="text-[10px] text-gray-500 mono break-words">{srcLabel}</div>
+              )}
+              {diag.baseline_pe != null && diag.market_pe != null && (
+                <div className="text-[10px] text-gray-500 mono">
+                  baseline P/E {diag.baseline_pe}x vs market {Number(diag.market_pe).toFixed(1)}x
+                </div>
+              )}
+              {diag.years_resolved?.length > 0 && (
+                <div className="text-[10px] text-gray-500 mono">
+                  fiscal years {diag.years_resolved[0]}–{diag.years_resolved[diag.years_resolved.length - 1]}
+                  {diag.edgar_cik ? ` · EDGAR CIK ${diag.edgar_cik}` : ''}
+                </div>
+              )}
+              {Array.isArray(diag.sources) && diag.sources.length > 0 && (
+                <div className="flex flex-wrap gap-1 pt-0.5">
+                  {diag.sources.slice(0, 5).map((u, i) => (
+                    <a key={i} href={u} target="_blank" rel="noopener noreferrer"
+                      className="text-[9px] text-blue-500 hover:text-blue-700 bg-white border border-gray-200 rounded px-1.5 py-0.5">
+                      source {i + 1} ↗
+                    </a>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ValuationPanel component ─────────────────────────────────────────
 function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onRequireLogin }) {
   const { useState, useEffect, useCallback } = React;
   const [model,      setModel]     = useState(null);
@@ -227,6 +350,9 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
       });
       const data = await res.json();
       if (!res.ok || data.error) {
+        // A 422 means the inputs failed to reconcile with the market and
+        // nothing was saved. The reason is the useful part — show it whole
+        // rather than collapsing it to "Generation failed".
         setGenError(data.error || 'Generation failed');
       } else {
         // Reload model from DB
@@ -251,7 +377,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
         </div>
         <div className="bg-white rounded-xl border border-dashed border-gray-200 px-4 py-6 text-center">
           <div className="text-[13px] text-gray-400 mb-3">No valuation model yet</div>
-          {genError && <div className="text-[11px] text-red-500 mb-2">{genError}</div>}
+          {genError && <div className="text-[11px] text-red-500 mb-2 text-left leading-relaxed">{genError}</div>}
           <button
             onClick={generateValuation}
             disabled={generating}
@@ -364,6 +490,9 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
         </div>
       </div>
 
+      {/* ── Provenance / sanity banner — above the number it qualifies ── */}
+      <ValuationQualityBanner model={model} />
+
       {/* ── Edit Y0 Actuals (collapsible) ── */}
       {editMode && (
         <div className="bg-white rounded-xl border border-gray-100 shadow-sm mb-2">
@@ -437,6 +566,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
       {expanded && (() => {
         const sd = sdMap[activeTab]; if (!sd) return null;
         const { sc, proj } = sd;
+        const rationale = model.diagnostics?.rationales?.[activeTab];
         return (
           <div className="bg-white rounded-xl border border-gray-100 shadow-sm mt-1 overflow-hidden">
             {/* Scenario tabs */}
@@ -448,6 +578,14 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
                 </button>
               ))}
             </div>
+
+            {/* Why this scenario looks like it does — the grounded rationale,
+                so an assumption can be argued with rather than just accepted. */}
+            {rationale && (
+              <div className="px-3 py-2 border-b border-gray-50 bg-gray-50/50">
+                <div className="text-[10px] text-gray-500 leading-relaxed">{rationale}</div>
+              </div>
+            )}
 
             {/* Assumptions chips */}
             <div className="grid grid-cols-3 border-b border-gray-100">
