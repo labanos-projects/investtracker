@@ -74,7 +74,7 @@ function actualsTable(rows, ccy) {
 }
 
 /**
- * Grounded research pass → prose + citations.
+ * Grounded research pass → prose + citations + the 5-year multiple range.
  *
  * Cached 24h on ticker+date. This is the expensive half — a live search plus a
  * long generation — and a company's forward outlook does not move hour to
@@ -85,7 +85,10 @@ async function research(inputs, env, refresh) {
   const day = new Date().toISOString().slice(0, 10);
   const { symbol, currency: ccy } = inputs;
 
-  return cachedValue(`valuation-research:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
+  // Cache key carries a version. The prompt below now asks for a trailing
+  // machine-readable line, and a cached v1 answer does not have it — bumping the
+  // key retires those instead of silently degrading to "no range found" for a day.
+  return cachedValue(`valuation-research:v2:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
     const { text, sources } = await gemini(env, {
       contents: [{ parts: [{ text:
 `You are an equity analyst preparing the forward assumptions for a 5-year DCF on ${symbol}${inputs.company ? ` (${inputs.company})` : ''}. Today is ${day}.
@@ -111,11 +114,22 @@ ${actualsTable(inputs.history, ccy)}
 6. What would have to go RIGHT for the bull case, and how much of it is already in the price.
 7. Buybacks or issuance: is the share count rising or falling, and at what rate?
 
-Be concrete and quantitative. If a figure is disputed or unavailable, say so rather than supplying a confident number.` }] }],
+Be concrete and quantitative. If a figure is disputed or unavailable, say so rather than supplying a confident number.
+
+FINALLY, end your reply with one line in exactly this format and nothing else on it:
+PE_RANGE_5Y: low=<number> high=<number> median=<number>
+Use the P/E this company has ACTUALLY traded at over the last five years. If you cannot establish it from the sources, write: PE_RANGE_5Y: unknown` }] }],
       tools: [{ google_search: {} }],
       generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
     });
-    return { notes: text, sources };
+    // Pulled out of the prose so the structuring pass gets a number rather than
+    // a paragraph. Question 4 already asked for the range, but a range buried in
+    // four sentences of commentary is a range the next prompt can ignore — and
+    // did: NOW came back with a base exit multiple of 72.5x against a trailing
+    // 69.1x, i.e. five years of growth AND no compression.
+    const m = text.match(/PE_RANGE_5Y:\s*low\s*=\s*([\d.]+)\s+high\s*=\s*([\d.]+)\s+median\s*=\s*([\d.]+)/i);
+    const peRange = m ? { low: +m[1], high: +m[2], median: +m[3] } : null;
+    return { notes: text, sources, peRange };
   });
 }
 
@@ -140,10 +154,27 @@ const SCENARIO_PROPS = {
 };
 
 /** Ungrounded structuring pass → strict JSON. Not cached. */
-async function structure(inputs, notes, env) {
+async function structure(inputs, notes, env, peRange) {
   const y0 = inputs.actuals[inputs.actuals.length - 1];
   const gm0 = y0.gross_profit && y0.revenue ? (y0.gross_profit / y0.revenue) : null;
   const om0 = y0.op_income && y0.revenue ? (y0.op_income / y0.revenue) : null;
+  const pe = inputs.pe_trailing ?? null;
+
+  // The base case exits at the company's own five-year MEDIAN multiple, not at
+  // today's.
+  //
+  // min(today, median) was the first instinct and it is wrong in one direction:
+  // it forbids the recovery case. Novo trades near 10x against a ~30x history,
+  // and a base case that may not re-rate above 10x cannot express the thesis
+  // that the de-rating was an overreaction. Meanwhile an expensive name gets
+  // exactly the discipline it needs, because its median sits below today.
+  //
+  // The median is the honest anchor in both directions: revert to what this
+  // business has actually been worth, and say so out loud if you won't.
+  const ceiling = peRange?.median ?? pe;
+  const anchorText = peRange
+    ? `Observed 5-year P/E range: low ${peRange.low}x, median ${peRange.median}x, high ${peRange.high}x. Today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}.`
+    : `No 5-year P/E range could be established from the notes. Today's trailing P/E ${pe != null ? pe.toFixed(1) + 'x' : 'is unknown'} is therefore the only anchor you have.`;
 
   const { text, finishReason } = await gemini(env, {
     contents: [{ parts: [{ text:
@@ -152,7 +183,10 @@ async function structure(inputs, notes, env) {
 ## Baseline (FY${y0.fiscal_year}, filed — fixed, do not restate)
 revenue ${money(y0.revenue, 'M')}, EBIT ${money(y0.op_income, 'M')}, net income ${money(y0.net_income, 'M')}, diluted shares ${money(y0.shares, 'M')}
 Current gross margin ${gm0 != null ? (gm0 * 100).toFixed(1) + '%' : 'n/a'}, operating margin ${om0 != null ? (om0 * 100).toFixed(1) + '%' : 'n/a'}
-Trailing P/E today: ${inputs.pe_trailing != null ? inputs.pe_trailing.toFixed(1) + 'x' : 'unknown'}
+Trailing P/E today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}
+
+## Multiple anchor
+${anchorText}
 
 ## How the numbers are used
 Revenue compounds at rev_growth for 5 years. Gross and operating margin move in a straight line from the FY${y0.fiscal_year} figures above to tgt_gm / tgt_om over those 5 years. Net income = revenue x tgt_om x op_conv. Share count compounds at shr_chg (NEGATIVE = buybacks). Terminal EPS is multiplied by the exit multiple distribution and discounted at disc_rt.
@@ -162,7 +196,9 @@ Revenue compounds at rev_growth for 5 years. Gross and operating margin move in 
 - rev_growth, tgt_gm, tgt_om, op_conv, shr_chg, disc_rt, mos are DECIMAL FRACTIONS (0.12 = 12%).
 - tgt_gm and tgt_om must be reachable from today's margins. A 5-year path does not double an operating margin without a specific reason in the notes.
 - Exactly 10 exit multiples per scenario, weights summing to 1.0.
-- ANCHOR THE MULTIPLES ON THE OBSERVED HISTORICAL RANGE FROM THE NOTES AND ON TODAY'S ${inputs.pe_trailing != null ? inputs.pe_trailing.toFixed(1) + 'x' : 'multiple'} — not on a multiple you remember for this company. A high-growth company should normally exit BELOW its current multiple, because growth decelerates as it scales. Only exceed today's multiple if the notes give a specific reason.
+- MULTIPLE CEILING (hard rule): the WEIGHTED-AVERAGE exit multiple of the BASE case must not exceed ${ceiling != null ? ceiling.toFixed(1) + 'x' : "today's multiple"}. Growth is already in your rev_growth; a flat or rising multiple on top of it charges for the same optimism twice. If you exceed the ceiling, name the specific reason from the notes in the rationale.
+- The bear case's weighted-average exit multiple must be BELOW the base case's. The bull case may exceed base but must stay within the observed 5-year high${peRange ? ` of ${peRange.high}x` : ''}.
+- Anchor every multiple on the range above, not on a multiple you remember for this company.
 - disc_rt: roughly 0.09 bear, 0.08 base, 0.08 bull; raise it for a genuinely riskier business.
 - mos: roughly 0.30 bear, 0.20 base, 0.15 bull.
 - rationale: ONE sentence, 200 characters maximum, naming what justifies the growth rate and the exit multiple band. Do not restate the notes.
@@ -290,8 +326,8 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
   }
   if (inputs.reconciliation.status === 'warn') flags.push('share_count_drift');
 
-  const { notes, sources } = await research(inputs, env, refresh);
-  const parsed = await structure(inputs, notes, env);
+  const { notes, sources, peRange } = await research(inputs, env, refresh);
+  const parsed = await structure(inputs, notes, env, peRange);
 
   const y0 = inputs.actuals[inputs.actuals.length - 1];
 
@@ -359,11 +395,18 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
     flags.push('baseline_pe_diverges_from_market');
   }
 
-  // A base case that exits above today's multiple is assuming a re-rating, on
-  // top of growth. Legal, but it should be visible rather than buried in a
-  // distribution.
+  // A base case exiting above the company's own five-year median is assuming a
+  // re-rating on top of five years of growth. Legal, but it should be on screen
+  // rather than buried in a distribution.
+  //
+  // The old threshold was `> pe_trailing * 1.5`, which is not a re-rating check
+  // — it is a check for an absurdity. NOW exited at 72.5x against a trailing
+  // 69.1x, a ratio of 1.05, sailed through, and contributed most of a +212%
+  // upside. Anchoring on the median instead catches that without forbidding a
+  // genuine recovery thesis on a de-rated name.
   const baseMult = perScenario.base?.avg_exit_multiple;
-  if (baseMult && inputs.pe_trailing && baseMult > inputs.pe_trailing * 1.5) {
+  const multCeiling = peRange?.median ?? inputs.pe_trailing;
+  if (baseMult && multCeiling && baseMult > multCeiling) {
     flags.push('base_exit_multiple_above_current_pe');
   }
   if (inputs.months_since_y0 >= 9) flags.push('baseline_year_stale');
@@ -395,6 +438,8 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
       upside: Math.round(upside * 1000) / 1000,
       baseline_pe: baselinePe ? Math.round(baselinePe * 10) / 10 : null,
       market_pe: inputs.pe_trailing ?? null,
+      pe_range_5y: peRange || null,
+      base_multiple_ceiling: multCeiling ?? null,
       rationales: Object.fromEntries(scenarios.map(s => [s.scenario, s._rationale])),
       sources,
       elapsed_ms: Date.now() - t0,
