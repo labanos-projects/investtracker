@@ -152,6 +152,8 @@ const FLAG_TEXT = {
     'Baseline earnings imply an entry P/E well away from the market’s trailing P/E.',
   base_exit_multiple_above_current_pe:
     'The base case exits above today’s multiple, so it assumes a re-rating on top of growth.',
+  exit_multiple_ignores_margin_expansion:
+    'The base case expands operating margin AND still exits near today’s multiple. Today’s multiple is high partly because earnings are depressed, so this counts the same recovery twice.',
   baseline_year_stale:
     'The last full fiscal year is 9+ months old — results reported since it closed are not in the baseline.',
 };
@@ -220,6 +222,11 @@ function ValuationQualityBanner({ model }) {
               {diag.baseline_pe != null && diag.market_pe != null && (
                 <div className="text-[10px] text-gray-500 mono">
                   baseline P/E {diag.baseline_pe}x vs market {Number(diag.market_pe).toFixed(1)}x
+                </div>
+              )}
+              {diag.margin_adjusted_ceiling != null && (
+                <div className="text-[10px] text-gray-500 mono">
+                  exit multiple ceiling {diag.margin_adjusted_ceiling}x after {diag.margin_uplift}x margin uplift
                 </div>
               )}
               {diag.years_resolved?.length > 0 && (
