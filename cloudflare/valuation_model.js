@@ -239,6 +239,7 @@ Revenue compounds at rev_growth for 5 years. Gross and operating margin move in 
 - tgt_gm and tgt_om must be reachable from today's margins. A 5-year path does not double an operating margin without a specific reason in the notes.
 - Exactly 10 exit multiples per scenario, weights summing to 1.0.
 - MULTIPLE CEILING (hard rule): the WEIGHTED-AVERAGE exit multiple of the BASE case must not exceed ${ceiling != null ? ceiling.toFixed(1) + 'x' : "today's multiple"}. Growth is already in your rev_growth; a flat or rising multiple on top of it charges for the same optimism twice. If you exceed the ceiling, name the specific reason from the notes in the rationale.
+- MARGIN / MULTIPLE CONSISTENCY (hard rule): if your tgt_om sits above today's operating margin of ${om0 != null ? (om0 * 100).toFixed(1) + '%' : 'n/a'}, you are ALREADY banking that improvement inside terminal EPS. Deflate the ceiling by the same factor: base weighted-average exit multiple must not exceed ${ceiling != null ? ceiling.toFixed(1) + 'x' : "the ceiling"} x (${om0 != null ? (om0 * 100).toFixed(1) + '%' : 'today OM'} / your tgt_om). Today's multiple is high BECAUSE earnings are currently depressed; once margins normalise the multiple ON NORMALISED EARNINGS is lower by construction. Claiming the margin expansion and the peak multiple together is the single most common way this model produces an absurd fair value.
 - The bear case's weighted-average exit multiple must be BELOW the base case's. The bull case may exceed base but must stay within the observed 5-year high${peRange ? ` of ${peRange.high}x` : ''}.
 - Anchor every multiple on the range above, not on a multiple you remember for this company.
 - disc_rt: roughly 0.09 bear, 0.08 base, 0.08 bull; raise it for a genuinely riskier business.
@@ -274,9 +275,9 @@ ${notes}` }] }],
       // thinkingConfig.thinkingBudget was 0 here, added as belt-and-braces
       // against a truncation that `thesis` had actually caused. Removing thesis
       // fixed the truncation; disabling thinking only made the model likelier to
-      // drop a field while juggling the three multiple rules above — which is
-      // exactly what happened to NOW's bear scenario. maxOutputTokens is
-      // generous now that no unbounded string leads the object.
+      // drop a field while juggling the multiple rules above — which is exactly
+      // what happened to NOW's bear scenario. maxOutputTokens is generous now
+      // that no unbounded string leads the object.
       maxOutputTokens: 16384,
     },
   });
@@ -475,6 +476,32 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
   if (baseMult && multCeiling && baseMult > multCeiling) {
     flags.push('base_exit_multiple_above_current_pe');
   }
+
+  // ── Margin expansion and a peak multiple are the same claim, counted twice ──
+  //
+  // A trailing P/E is high partly BECAUSE earnings are currently depressed. If
+  // the model then expands the operating margin inside terminal EPS, that same
+  // recovery appears once in the numerator and again in the multiple. The
+  // multiple ON NORMALISED EARNINGS is lower by construction, by roughly the
+  // margin uplift factor.
+  //
+  // ServiceNow, once the multiple ceiling was working: base tgt_om 19-28%
+  // against a filed 13.7%, exit multiple pinned at the full 69.5x ceiling.
+  // Each assumption is arguable on its own; together they were +163% to +329%.
+  // Deflated, the ceiling is 34-50x — an ordinary multiple for the mature
+  // software business the model is claiming the company will have become.
+  const om0Actual = (y0.op_income && y0.revenue) ? y0.op_income / y0.revenue : null;
+  const baseScenario = scenarios.find(s => s.scenario === 'base');
+  // Only ever deflates. A model assuming margin COMPRESSION does not thereby
+  // earn a higher exit multiple.
+  const marginUplift = (om0Actual > 0 && baseScenario?.tgt_om > 0)
+    ? Math.max(1, baseScenario.tgt_om / om0Actual)
+    : 1;
+  const adjustedCeiling = multCeiling != null ? multCeiling / marginUplift : null;
+  if (baseMult && adjustedCeiling && marginUplift > 1.1 && baseMult > adjustedCeiling) {
+    flags.push('exit_multiple_ignores_margin_expansion');
+  }
+
   if (inputs.months_since_y0 >= 9) flags.push('baseline_year_stale');
 
   const quality = flags.length === 0 ? 'ok' : 'warn';
@@ -506,6 +533,8 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
       market_pe: inputs.pe_trailing ?? null,
       pe_range_5y: peRange || null,
       base_multiple_ceiling: multCeiling ?? null,
+      margin_uplift: Math.round(marginUplift * 100) / 100,
+      margin_adjusted_ceiling: adjustedCeiling != null ? Math.round(adjustedCeiling * 10) / 10 : null,
       rationales: Object.fromEntries(scenarios.map(s => [s.scenario, s._rationale])),
       sources,
       elapsed_ms: Date.now() - t0,
