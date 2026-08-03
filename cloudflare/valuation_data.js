@@ -33,15 +33,16 @@
 // catches the entire NOW class of failure, because a 5:1 split shows up as a
 // ratio of 5.0 and nothing else does.
 //
-// ── XBRL: the same two traps as the screener ──
+// ── XBRL: three traps, all of which produce confident wrong numbers ──
 //
-// This file parses SEC companyfacts, exactly as `edgarFacts()` in
-// screener_data.js does, and applies the same two fixes. They are duplicated
-// deliberately rather than shared, because screener_data.js does not carry the
-// `op_income` tags a DCF needs and rewriting it wholesale to add them is a
-// larger blast radius than 30 lines of parsing. If you change the period-keying
-// or the split-scoping HERE, change it THERE too — both produce silent wrong
-// numbers, not errors.
+// This file parses SEC companyfacts, as `edgarFacts()` in screener_data.js
+// does, and applies the same first two fixes. They are duplicated deliberately
+// rather than shared, because screener_data.js does not carry the `op_income`
+// tags a DCF needs and rewriting it wholesale to add them is a larger blast
+// radius than 30 lines of parsing. If you change the period-keying or the
+// split-scoping HERE, change it THERE too — both produce silent wrong numbers,
+// not errors. The third trap is valuation-only, because only a DCF cares about
+// a share count more recent than the last annual report.
 //
 //   (a) `fy` is the fiscal year of the REPORT, not of the data point. One NVDA
 //       10-K carries three annual periods all tagged fy=2025. Key on the
@@ -49,7 +50,9 @@
 //   (b) Per-share quantities are restated across splits, and only WITHIN a
 //       filing. Merging filings reads a 10:1 split as 10x dilution. Share
 //       counts therefore come from the latest accession's own comparatives.
-// ─────────────────────────────────────────────────────────────────────────────
+//   (c) A split can happen AFTER the last annual report, leaving the 10-K
+//       self-consistent and stale. See splitFactorSinceAnnual below.
+// ────────────────────────────────────────────────────────────────────────
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
 import { yahooSummary, yahooCrumb, secCik } from './screener_data.js';
@@ -120,6 +123,50 @@ const TAGS = {
 // Split-restated quantities: scope to a single filing. See trap (b) above.
 const SPLIT_SENSITIVE = new Set(['shares']);
 
+// ─── Trap (c): a split that happens AFTER the last annual report ──────────────
+//
+// Scoping share counts to one filing fixes splits the latest 10-K has already
+// restated. It does nothing for a split announced since, because the 10-K is
+// then entirely self-consistent and entirely out of date.
+//
+// Mueller Industries split 2-for-1 between its FY2025 10-K (filed 2026-02-25,
+// 111,492,000 shares) and its Q2 2026 10-Q (filed 2026-07-22, 221,192,000).
+// Nothing inside the 10-K hints at it; the market cap implied 221M against a
+// filed 111M, the reconciliation gate read 1.98 and refused to save. Correct,
+// and useless — the right number was sitting in a 10-Q we weren't reading.
+//
+// So: compare the annual basis against the most recently FILED share figure of
+// ANY form. Absent a split those agree within a couple of percent; a split
+// shows up as a clean multiple.
+//
+// Why not simply diff restatements across filings? Because that breaks the case
+// trap (b) already handles. ServiceNow's FY2025 10-K restates FY2023 from
+// 205,591,000 to 1,027,953,000 — a genuine 5:1 — and our annual series is
+// ALREADY on the restated basis. Detecting that restatement and applying it
+// again would multiply a correct series by five. Anchoring on the annual basis
+// we actually returned asks the only question that matters: is THIS series
+// stale? For NOW it is not (1,039.9M latest vs 1,046.7M annual, ratio 0.99).
+const SPLIT_CANDIDATES = [1.5, 2, 3, 4, 5, 6, 7, 8, 10, 15, 20];
+const SPLIT_RATIOS = [...SPLIT_CANDIDATES, ...SPLIT_CANDIDATES.map(c => 1 / c)];
+const SPLIT_TOLERANCE = 0.02;
+
+function splitFactorSinceAnnual(allRows, annualBasis) {
+  if (!(annualBasis > 0) || !allRows?.length) return 1;
+  const dated = allRows.filter(r => r.filed && r.end && r.val > 0);
+  if (!dated.length) return 1;
+  const maxFiled = dated.reduce((a, r) => (r.filed > a ? r.filed : a), '');
+  const newest = dated.filter(r => r.filed === maxFiled)
+                      .sort((a, b) => a.end.localeCompare(b.end)).pop();
+  if (!newest) return 1;
+  const ratio = newest.val / annualBasis;
+  // Buybacks and issuance move the count a few percent a year. Only a clean
+  // multiple is a split; anything else unexplained is left alone, so the
+  // reconciliation gate still gets to refuse it.
+  if (Math.abs(ratio - 1) <= SPLIT_TOLERANCE) return 1;
+  for (const c of SPLIT_RATIOS) if (Math.abs(ratio / c - 1) <= SPLIT_TOLERANCE) return c;
+  return 1;
+}
+
 export async function valuationFacts(cik, refresh = false) {
   const padded = String(cik).padStart(10, '0');
   // Same cache key as screener_data.js `edgarFacts` on purpose — companyfacts
@@ -159,15 +206,25 @@ export async function valuationFacts(cik, refresh = false) {
         map.set(y, r.val);
         ends.set(y, r.end);
       }
-      return { unit: unitKey, map, ends };
+      // `all` is every row for this unit, unfiltered by form — the 10-Qs are
+      // where a split that post-dates the last 10-K becomes visible.
+      return { unit: unitKey, map, ends, all: units[unitKey] || [] };
     }
     return null;
   };
 
-  const out = { currency: null, entityName: d.entityName, ends: new Map() };
+  const out = { currency: null, entityName: d.entityName, ends: new Map(), split_adjustment: 1 };
   for (const [field, aliases] of Object.entries(TAGS)) {
     const got = pull(aliases, SPLIT_SENSITIVE.has(field));
     if (!got) continue;
+    if (SPLIT_SENSITIVE.has(field) && got.map.size) {
+      const latestYear = [...got.map.keys()].sort((a, b) => a - b).pop();
+      const factor = splitFactorSinceAnnual(got.all, got.map.get(latestYear));
+      if (factor !== 1) {
+        for (const [y, v] of got.map) got.map.set(y, v * factor);
+        out.split_adjustment = factor;
+      }
+    }
     out[field] = got.map;
     for (const [y, e] of got.ends) if (!out.ends.has(y)) out.ends.set(y, e);
     // Share counts carry a "shares" unit, not a currency — don't let them set
@@ -251,7 +308,11 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
     shares: 'dilutedAverageShares',
   };
 
-  const sources = {};
+  // Provenance is recorded PER YEAR and collapsed to the baseline year at the
+  // end. Recording it during the loop reported whichever source answered the
+  // EARLIEST year — NOW's shares read "yahoo-ts" because only Yahoo had 2019,
+  // while the FY2023-25 figures the model actually stands on came from EDGAR.
+  const rowSources = new Map();
   const years = yearsOf(
     edgar?.revenue, edgar?.net_income,
     ts?.totalRevenue, ts?.netIncome,
@@ -266,7 +327,11 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
       if (edgar?.[f]?.has(y)) { v = edgar[f].get(y); src = 'edgar'; }
       else if (ts?.[tsAlias[f]]?.has(y)) { v = ts[tsAlias[f]].get(y); src = 'yahoo-ts'; }
       row[f] = toM(v);
-      if (row[f] !== null) { any = true; sources[f] = sources[f] || src; }
+      if (row[f] !== null) {
+        any = true;
+        if (!rowSources.has(y)) rowSources.set(y, {});
+        rowSources.get(y)[f] = src;
+      }
     }
     if (any) rows.push(row);
   }
@@ -293,6 +358,14 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
   }
 
   const y0 = actuals[actuals.length - 1];
+
+  // Collapse provenance to the baseline year, and say so when the share count
+  // had to be rebased for a split the annual report predates.
+  const sources = { ...(rowSources.get(y0.fiscal_year) || {}) };
+  const splitAdj = edgar?.split_adjustment ?? 1;
+  if (splitAdj !== 1 && sources.shares) {
+    sources.shares = `${sources.shares}(split-adjusted ${splitAdj}x)`;
+  }
 
   // ── Reconciliation against the market ──────────────────────────────────────
   // The check that would have stopped the ServiceNow model. Everything above
@@ -365,6 +438,7 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
       market_ok: marketOk,
       market_err: summary?._err || null,
       field_sources: sources,
+      split_adjustment: splitAdj,
       years_resolved: history.map(r => r.fiscal_year),
       reconciliation: recon.status,
       refresh,
