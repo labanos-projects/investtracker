@@ -205,11 +205,14 @@ function yfSearch(q, { news = 0, quotes = 0 }, refresh) {
  * unioning in — this is the source most likely to still be carrying a story
  * that the search index has already aged out.
  *
- * Best-effort by design. It is an undocumented feed, it may return nothing,
- * and Workers have no DOM parser so the XML is picked apart with regex. If any
- * of that fails the function returns [] and the other sources carry the
- * request. Its contribution is reported in ?debug=1 so you can tell whether it
- * is actually pulling its weight rather than assuming.
+ * It earns its place: on the first live NOVO-B.CO request it returned 20 items
+ * against the search endpoint's 10, and it is what surfaced the ZEUS trial
+ * coverage from 31 July that search had already dropped.
+ *
+ * Still best-effort. It is an undocumented feed and Workers have no DOM parser,
+ * so the XML is picked apart with regex. If any of that fails the function
+ * returns [] and the other sources carry the request; its contribution is
+ * reported in ?debug=1.
  */
 async function rssHeadlines(symbol, refresh) {
   if (!symbol) return [];
@@ -251,12 +254,15 @@ async function rssHeadlines(symbol, refresh) {
 /**
  * Peer companies, used only to decide what counts as `related`.
  *
- * Without names this is useless: matching the symbol "LLY" does not match the
+ * Without names this is weak: matching the symbol "LLY" does not match the
  * headline "Will Mounjaro & Zepbound Drive Lilly's Q2 Results". So the
  * recommended symbols are resolved to display names in one batched quote call,
- * and both forms become aliases. Two extra upstream calls, cached for a day,
- * and every failure path degrades to an empty peer list — which costs a
- * `related` classification, never a `company` one.
+ * and both forms become aliases.
+ *
+ * In production that second call currently returns nothing usable — v7/quote is
+ * crumb-gated — so `related` is running on symbols and sector terms alone and
+ * is narrower than intended. That is the designed failure: it costs a `related`
+ * classification, never a `company` one.
  */
 async function resolvePeers(symbol, refresh) {
   const empty = { symbols: [], names: [] };
@@ -289,7 +295,7 @@ async function resolvePeers(symbol, refresh) {
   }
 }
 
-// Industry strings are marketing copy ("Drug Manufacturers—General"), so only
+// Industry strings are marketing copy ("Drug Manufacturers - General"), so only
 // the tokens carrying meaning survive. These are the weakest signal in the
 // file and are used exclusively to promote an article into `related` — never
 // into `company`.
@@ -442,11 +448,31 @@ export async function companyNews(yhTicker, hintName, { refresh = false, debug =
       error: res.status === 'rejected' ? String(res.reason?.message || res.reason) : null,
     });
     for (const n of items) {
-      // Dedupe on the link, falling back to the normalised title: syndicated
-      // wire copy reaches us under several Yahoo URLs with identical headlines.
-      const key = n?.link || norm(n?.title);
-      if (!key || pool.has(key)) continue;
-      pool.set(key, n);
+      // Dedupe on the TITLE, not the link.
+      //
+      // Keying on the link looked right and was wrong in production: the RSS
+      // feed returns the same articles as /finance/search with `?.tsrc=rss`
+      // appended, and sometimes on the publisher's own domain rather than
+      // Yahoo's. Different strings, same story. The first live NOVO-B.CO
+      // response came back 21 items / 15 unique, so the five-item preview was
+      // spending three of its slots on the same two stories twice over.
+      //
+      // Titles are what a reader actually compares, and a genuine collision
+      // (two outlets, one headline) is a duplicate to a reader as well.
+      const key = norm(n?.title) || n?.link;
+      if (!key) continue;
+
+      const existing = pool.get(key);
+      if (!existing) { pool.set(key, n); continue; }
+
+      // Same story twice: keep whichever copy carries more. RSS attributes
+      // everything to "Yahoo Finance" and never has a thumbnail, so the search
+      // copy wins on both counts when we have it. Written to be
+      // order-independent rather than relying on search running first.
+      const better =
+        (!existing.thumbnail && n.thumbnail) ||
+        (existing.publisher === 'Yahoo Finance' && n.publisher && n.publisher !== 'Yahoo Finance');
+      if (better) pool.set(key, n);
     }
   });
 
