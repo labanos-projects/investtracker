@@ -16,6 +16,14 @@
 // null the page fetches its own snapshot from the Worker's ?quote= endpoint,
 // which is the only source of currency/company/sector for a symbol that has no
 // row in `portfolio`.
+//
+// TWO IDENTIFIERS, and every child gets the one it needs. `ticker` is the
+// app's own key — it is what `portfolio`, `investment_notes`, `transactions`
+// and `valuation_models` are keyed on. `yhTicker` is a LISTING, and therefore
+// picks the exchange, the price and the currency. For anything not listed in
+// the US they name different securities: ASML.AS is Amsterdam in EUR, bare
+// ASML is Nasdaq in USD. Sending the storage key where a listing is wanted is
+// how the valuation model came to be built on the wrong exchange.
 
 function TickerPage({
   ctx, position, initialTxns, portfolioId, baseCcy, isLive, user,
@@ -383,10 +391,18 @@ function TickerPage({
       />
 
       {/* ── Valuation model ── */}
-      {/* portfolio_id 0 for un-held tickers: valuation_models is unique on
+      {/* Both identifiers, for the same reason ScoreBlock takes both, but with
+          the roles reversed: `ticker` is what valuation_models is keyed on and
+          what the panel loads by, while `yhTicker` decides which LISTING gets
+          valued — and therefore the price and currency the whole model is
+          denominated in. Passing only `ticker` had the worker value bare ASML
+          on Nasdaq in USD while this page showed ASML.AS in EUR.
+
+          portfolio_id 0 for un-held tickers: valuation_models is unique on
           (ticker, model_date) and stores portfolio_id for audit only. */}
       <ValuationPanel
         ticker={ticker}
+        yhTicker={yhTicker}
         portfolioId={isHolding ? portfolioId : 0}
         currentPrice={price}
         currency={ccy}
