@@ -63,7 +63,19 @@ const NEWS_TTL     = 15 * 60;        // headlines move; fundamentals do not
 const IDENTITY_TTL = 24 * 3600;      // names, listings, peers: effectively static
 const MAX_COMPANY  = 30;             // the panel paginates; give it room
 const MAX_RELATED  = 10;
-const MAX_AGE_DAYS = 21;
+
+// A sanity bound, not an editorial window.
+//
+// This was 21 days, which was fine for Novo and wrong for everything quiet.
+// CSU.TO pooled 23 articles and dropped 22 of them as stale while dropping
+// ZERO as irrelevant: every one was genuinely about Constellation Software,
+// just older than three weeks. A company that makes news quarterly ended up
+// with a one-item panel.
+//
+// Recency sorting already puts fresh news on top, and each row renders its own
+// age ("18d ago"), so nothing old is passed off as current. The cutoff only
+// needs to stop genuinely ancient material from padding the tail.
+const MAX_AGE_DAYS = 365;
 
 // ─── Text normalisation ─────────────────────────────────────────────────────
 
@@ -336,9 +348,10 @@ export async function resolveIdentity(yhTicker, hintName, refresh = false) {
     const longName = summary?.longName || hintName || null;
     const core = coreName(longName);
 
-    // The company's other listings. The US line is the prize: Yahoo's news
-    // coverage of NVO is an order of magnitude better than of NOVO-B.CO, and
-    // it is the same company.
+    // The company's other listings. The US line is usually the prize: Yahoo's
+    // news coverage of NVO is an order of magnitude better than of NOVO-B.CO,
+    // and it is the same company. It is not always the prize — see the RSS
+    // fan-out in companyNews() for the OTC-ADR case.
     let listings = [];
     try {
       const q = await yfSearch(core || listing, { quotes: 8 }, refresh);
@@ -428,12 +441,25 @@ const shape = (n) => ({
 export async function companyNews(yhTicker, hintName, { refresh = false, debug = false } = {}) {
   const id = await resolveIdentity(yhTicker, hintName, refresh);
 
+  // RSS is pulled for the resolved primary AND the original listing.
+  //
+  // Preferring the US line is usually right — NVO's coverage dwarfs
+  // NOVO-B.CO's — but it inverts for companies whose US line is a thin OTC
+  // ADR. CSU.TO resolves to CNSWY, and Toronto is where Constellation actually
+  // trades and gets written about.
+  //
+  // This is done through RSS rather than a second search query on purpose: the
+  // RSS feed is genuinely symbol-keyed, so `s=CSU.TO` is a valid lookup, while
+  // `q=CSU.TO` against /finance/search is free text and is precisely the bug
+  // this whole module exists to fix.
+  const rssSymbols = [...new Set([id.primary, id.listing].filter(Boolean))];
+
   // Every source is allowed to fail alone. A dead RSS feed must not cost us the
   // search results, and vice versa — this is the same allSettled discipline the
   // ?quote= endpoint uses for exactly the same reason.
   const jobs = [
     ...id.queries.map(q => ({ label: `search:${q}`, p: yfSearch(q, { news: 20 }, refresh).then(d => d?.news || []) })),
-    { label: `rss:${id.primary}`, p: rssHeadlines(id.primary, refresh) },
+    ...rssSymbols.map(sym => ({ label: `rss:${sym}`, p: rssHeadlines(sym, refresh) })),
   ];
   const settled = await Promise.allSettled(jobs.map(j => j.p));
 
