@@ -36,6 +36,26 @@ const IMPLAUSIBLE_UPSIDE = 1.0;      // +100%
 // grower legitimately drifts (a fiscal year-end is not TTM), so this is wide.
 const EPS_DRIFT_WARN = 0.40;
 
+// ── The multiple ceiling has to come from somewhere ──
+//
+// `ceiling = min(today's trailing P/E, the observed 5-year median)`. When the
+// research pass fails to return a range there is no min() — there is just the
+// trailing multiple, unchecked, and the whole reason min() exists is that a
+// trailing P/E is meaningless when the denominator is near zero.
+//
+// Above this level, "no observed range" and "trailing P/E" together are not an
+// anchor, they are a number that is large BECAUSE earnings are currently
+// depressed. Cameco regenerated on 2026-08-04 with a market P/E of 153.6x (up
+// from 84.7x the previous day on falling TTM earnings), took that as its
+// ceiling, exited the base case at 134.7x and returned +59.7% — with
+// data_quality "ok" and an empty flags array, because every existing check
+// compares against the same 153.6x.
+//
+// So: refuse. This file already errors rather than invent when no source
+// answers for the ACTUALS; an exit multiple with no observed range and no
+// usable trailing anchor is the same situation one layer up.
+const NO_ANCHOR_PE_MAX = 60;
+
 async function gemini(env, body) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${env.GEMINI_API_KEY}`,
@@ -85,11 +105,13 @@ async function research(inputs, env, refresh) {
   const day = new Date().toISOString().slice(0, 10);
   const { symbol, currency: ccy } = inputs;
 
-  // Cache key carries a version. The prompt below now asks for a trailing
-  // machine-readable line, and a cached v1 answer does not have it — bumping the
-  // key retires those instead of silently degrading to "no range found" for a day.
-  return cachedValue(`valuation-research:v2:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
-    const { text, sources } = await gemini(env, {
+  // Cache key carries a version. v3 retires every v2 answer because those were
+  // produced under a 4096-token budget that was truncating the PE_RANGE_5Y
+  // line off the end of the reply — a cached v2 result is a cached failure.
+  const key = `valuation-research:v3:${symbol}:${day}`;
+
+  const produce = async () => {
+    const { text, sources, finishReason } = await gemini(env, {
       contents: [{ parts: [{ text:
 `You are an equity analyst preparing the forward assumptions for a 5-year DCF on ${symbol}${inputs.company ? ` (${inputs.company})` : ''}. Today is ${day}.
 
@@ -116,11 +138,19 @@ ${actualsTable(inputs.history, ccy)}
 
 Be concrete and quantitative. If a figure is disputed or unavailable, say so rather than supplying a confident number.
 
+LENGTH: keep the seven answers to 700 words in total. Terse and numeric beats thorough and discursive — the reply is parsed, not read, and a long answer risks losing the line below.
+
 FINALLY, end your reply with one line in exactly this format and nothing else on it:
 PE_RANGE_5Y: low=<number> high=<number> median=<number>
-Use the P/E this company has ACTUALLY traded at over the last five years. If you cannot establish it from the sources, write: PE_RANGE_5Y: unknown` }] }],
+Use the P/E this company has ACTUALLY traded at over the last five years. If you cannot establish it from the sources, write: PE_RANGE_5Y: unknown
+This line is the single most load-bearing output of this whole pass. If it is missing the model downstream has no observed anchor for the exit multiple and may refuse to run at all. Emit it even if everything above had to be cut short.` }] }],
       tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
+      // Was 4096. On 2.5 Flash the thinking budget is dynamic and counts
+      // against this same ceiling, so seven grounded answers plus reasoning
+      // could exhaust it before the trailing line was ever emitted — and
+      // `research()` used to throw finishReason away, so the truncation was
+      // invisible. See NO_ANCHOR_PE_MAX for what that cost downstream.
+      generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
     });
     // Pulled out of the prose so the structuring pass gets a number rather than
     // a paragraph. Question 4 already asked for the range, but a range buried in
@@ -129,8 +159,23 @@ Use the P/E this company has ACTUALLY traded at over the last five years. If you
     // 69.1x, i.e. five years of growth AND no compression.
     const m = text.match(/PE_RANGE_5Y:\s*low\s*=\s*([\d.]+)\s+high\s*=\s*([\d.]+)\s+median\s*=\s*([\d.]+)/i);
     const peRange = m ? { low: +m[1], high: +m[2], median: +m[3] } : null;
-    return { notes: text, sources, peRange };
-  });
+    return { notes: text, sources, peRange, finishReason };
+  };
+
+  const out = await cachedValue(key, TTL.AI_RESEARCH, refresh, produce);
+
+  // A failed extraction must not be inherited. cachedValue stores whatever
+  // produce() returns, so before this the first reply of the day that omitted
+  // the range pinned that omission to the ticker for a full 24 hours — every
+  // regenerate after it silently reused the failure. Ask again instead, and
+  // let the second answer overwrite the cache whichever way it goes: if it
+  // succeeds the ticker is fixed for the day, and if it fails the NEXT
+  // generate will retry again, because this branch keys off the result rather
+  // than off a counter.
+  if (out && !out.peRange) {
+    return await cachedValue(key, TTL.AI_RESEARCH, true, produce);
+  }
+  return out;
 }
 
 // Only forward assumptions. There is deliberately no field here for revenue,
@@ -206,6 +251,10 @@ async function structure(inputs, notes, env, peRange) {
   // honest base case for a de-rated name, and the re-rating belongs in the BULL
   // case, which is explicitly allowed to exceed base. Wanting the multiple to
   // recover is a second bet, and it should be priced as one.
+  //
+  // Note what happens when peRange is null: there is no min(), only `pe`. That
+  // is a degraded state, not a normal one — generateValuation refuses outright
+  // above NO_ANCHOR_PE_MAX and flags it below.
   const ceiling = (pe != null && peRange?.median != null) ? Math.min(pe, peRange.median) : pe;
 
   // A history far above today usually means the earnings base was depressed, not
@@ -215,7 +264,7 @@ async function structure(inputs, notes, env, peRange) {
   const anchorText = peRange
     ? `Observed 5-year P/E range: low ${peRange.low}x, median ${peRange.median}x, high ${peRange.high}x. Today: ${pe != null ? pe.toFixed(1) + 'x' : 'unknown'}.` +
       (historyInflated ? ` NOTE: that history sits far above today's multiple, which normally means GAAP earnings were depressed in those years rather than that the shares deserve a higher multiple. Treat the historical range as unreliable and anchor on today's.` : '')
-    : `No 5-year P/E range could be established from the notes. Today's trailing P/E ${pe != null ? pe.toFixed(1) + 'x' : 'is unknown'} is therefore the only anchor you have.`;
+    : `No 5-year P/E range could be established from the notes. Today's trailing P/E ${pe != null ? pe.toFixed(1) + 'x' : 'is unknown'} is therefore the only anchor you have, and it is an UNVERIFIED one — nothing has confirmed the company has ever sustainably traded there. Stay well below it.`;
 
   const buildRequest = (retry) => ({
     contents: [{ parts: [{ text:
@@ -391,7 +440,35 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
   }
   if (inputs.reconciliation.status === 'warn') flags.push('share_count_drift');
 
-  const { notes, sources, peRange } = await research(inputs, env, refresh);
+  const { notes, sources, peRange, finishReason: researchFinish } = await research(inputs, env, refresh);
+
+  // ── No observed multiple range ────────────────────────────────────────────
+  //
+  // Two grounded attempts have now failed to establish what this company has
+  // actually traded at. The ceiling below therefore collapses to today's
+  // trailing multiple with nothing checking it, which is the configuration
+  // VALUATION.md calls "actively dangerous" — and it has been the SILENT
+  // default for 11 of the last 13 models.
+  //
+  // Below NO_ANCHOR_PE_MAX a trailing P/E is at least a plausible anchor, so
+  // flag it and continue. Above it, refuse: a multiple that high is usually
+  // high because the denominator has collapsed, and anchoring on it produces a
+  // confident number that is wrong by construction. Erroring is the same
+  // choice this file already makes when no source answers for the actuals.
+  if (!peRange) {
+    if (inputs.pe_trailing != null && inputs.pe_trailing > NO_ANCHOR_PE_MAX) {
+      throw new Error(
+        `No 5-year P/E range could be established for ${symbol} after two grounded attempts, and ` +
+        `today's trailing ${inputs.pe_trailing.toFixed(1)}x is the only anchor left. A multiple that ` +
+        `high is usually high BECAUSE earnings are currently depressed, so pinning the exit multiple ` +
+        `to it produces a fair value that is wrong by construction. Refusing to model rather than ` +
+        `return a confident number — retry later, or set the multiples by hand. ` +
+        `(research finishReason=${researchFinish || 'unknown'})`
+      );
+    }
+    flags.push('no_observed_pe_range');
+  }
+
   const parsed = await structure(inputs, notes, env, peRange);
 
   const y0 = inputs.actuals[inputs.actuals.length - 1];
@@ -532,6 +609,10 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
       baseline_pe: baselinePe ? Math.round(baselinePe * 10) / 10 : null,
       market_pe: inputs.pe_trailing ?? null,
       pe_range_5y: peRange || null,
+      // Why the range is missing, when it is. `research()` used to throw this
+      // away, which is the only reason 11 consecutive models could degrade to
+      // an unchecked ceiling without anyone being able to say why.
+      research_finish_reason: researchFinish || null,
       base_multiple_ceiling: multCeiling ?? null,
       margin_uplift: Math.round(marginUplift * 100) / 100,
       margin_adjusted_ceiling: adjustedCeiling != null ? Math.round(adjustedCeiling * 10) / 10 : null,
