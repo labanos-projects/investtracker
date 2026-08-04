@@ -29,9 +29,25 @@
 //       symbol is a listing ("ASML.AS"), and for anything not listed in the US
 //       those name different securities. ASML was being valued on Nasdaq in USD
 //       while every other number on its page came from Amsterdam in EUR.
+// v17 – news rework. ?news= handed the exchange-suffixed LISTING symbol to
+//       Yahoo's free-text search endpoint. NOVO-B.CO matched nothing, so the
+//       response fell back to the general market firehose — Tesla, Miami-Dade
+//       early voting, Tibetan antelopes — and the panel rendered all of it as
+//       Novo Nordisk's news. NOVO-B returned empty; only bare US-resolvable
+//       symbols ever worked, which is to say: every non-US holding was broken.
+//
+//       Correcting the identifier was necessary and not sufficient. Querying
+//       NVO, the symbol that does work, the ZEUS ziltivekimab failure that took
+//       the stock down 9.3% and erased $30bn on 31 July was already outside
+//       newsCount=10 by 3 August. Depth is a second, independent defect.
+//
+//       news.js now resolves the listing to a company identity (name, sibling
+//       listings, sector, peers), fans out across several queries, and drops
+//       every article that matches neither the company nor its sector.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
+import { companyNews } from './news.js';
 
 export default {
   async fetch(request, env) {
@@ -206,16 +222,44 @@ export default {
     }
 
     // ── News endpoint ─────────────────────────────────────────────────────────────────────
+    // Resolution, fan-out and relevance filtering live in news.js. The handler
+    // this replaced was a single URL:
+    //
+    //   /v1/finance/search?q=${newsSymbol}&newsCount=10
+    //
+    // `q` there is FREE TEXT, not a symbol lookup, and it was being handed the
+    // app's Yahoo LISTING symbol. Against production that returned, for
+    // ?news=NOVO-B.CO, ten articles about Tesla, Miami-Dade early voting and
+    // Tibetan antelopes — and nothing about Novo Nordisk. A total miss came
+    // back empty; a partial miss came back as Yahoo's general market firehose,
+    // which the panel then rendered as company news. Every non-US listing took
+    // this path: ASML.AS, CSU.TO, CHG.DE.
+    //
+    // &name= is the company name the page already has on screen. It is a hint,
+    // not a requirement — it saves a quoteSummary round-trip and keeps the
+    // fan-out working when quoteSummary is down, since the company name is the
+    // single most productive query of the set.
+    //
+    // &debug=1 reports what each source contributed and how much was dropped,
+    // because "no news" and "everything was filtered out" look identical from
+    // the outside and are very different bugs.
     const newsSymbol = url.searchParams.get('news');
     if (newsSymbol) {
-      const yfUrl = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(newsSymbol)}&quotesCount=0&newsCount=10&listsCount=0`;
-      const res  = await fetch(yfUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' } });
-      const data = await res.json();
-      const news = (data?.news || []).map(n => ({
-        title: n.title, publisher: n.publisher, time: n.providerPublishTime,
-        link: n.link, thumbnail: n.thumbnail?.resolutions?.[0]?.url ?? null,
-      }));
-      return new Response(JSON.stringify({ news }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      try {
+        const payload = await companyNews(newsSymbol, url.searchParams.get('name'), {
+          refresh: url.searchParams.get('refresh') === '1',
+          debug:   url.searchParams.get('debug') === '1',
+        });
+        return new Response(JSON.stringify(payload), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      } catch (e) {
+        // 200 with an explicit error: the panel distinguishes "we could not
+        // look" from "there is nothing", and neither should take the page down.
+        return new Response(JSON.stringify({ news: [], related: [], error: String(e.message) }), {
+          headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
     }
 
     // ── Search endpoint ───────────────────────────────────────────────────────────────────
