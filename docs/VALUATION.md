@@ -9,9 +9,16 @@
 ## Valuation model (v2)
 
 A bear/base/bull 5-year DCF per ticker. Endpoint:
-`?generate_valuation=SYMBOL&portfolio_id=N[&current_price=X][&refresh=1]`
+`?generate_valuation=TICKER&yh_symbol=SYMBOL&portfolio_id=N[&current_price=X][&refresh=1]`
 (Bearer-auth). Orchestration in `valuation_model.js`, data in
 `valuation_data.js`.
+
+`generate_valuation` is the **storage key** — `valuation_models` is keyed on
+it and the panel loads by it. `yh_symbol` is the **listing**, and decides the
+exchange, the price and therefore the currency the whole model is denominated
+in. They coincide only for US listings; `ASML` is Nasdaq in USD and `ASML.AS`
+is Amsterdam in EUR. `yh_symbol` falls back to `generate_valuation` when
+absent.
 
 ### The one rule
 
@@ -97,6 +104,12 @@ the discrepancy. If a filer ever resolves shares from EDGAR on an *ordinary*
 basis while quoting as an ADR, reconciliation reads 0.2 and blocks it, which is
 the correct outcome.
 
+Note that fixing the currency also depends on resolving the right LISTING. Both
+were broken at once and each hid the other: the model was built on Nasdaq ASML
+in USD, and the panel then labelled that USD figure with the page's EUR and
+divided it by the EUR price. Correcting only one of the two produces a number
+that is differently wrong.
+
 ### The reconciliation gate
 
 Resolving from filings is necessary but not sufficient — a units slip or a
@@ -131,6 +144,7 @@ Computed on the assembled model before saving, and rendered in plain English by
 | `exit_multiple_ignores_margin_expansion` | margin expansion AND a near-peak multiple |
 | `share_count_drift` | reconciliation in the 20–50% band |
 | `baseline_year_stale` | last full fiscal year 9+ months old |
+| `no_observed_pe_range` | no 5-year range resolved, so the ceiling is today's multiple, unchecked |
 
 `baseline_pe_diverges_from_market` is the flag that eventually caught the
 currency bug, and it is worth understanding why it caught only one of three
@@ -141,8 +155,8 @@ units check, and should not be relied on as one.
 ### Exit multiple discipline — where the optimism actually lives
 
 Getting the actuals right removed the arithmetic error and left a judgement
-error, which took four attempts to calibrate. Both rules below exist because a
-specific wrong number shipped without them:
+error. Two rules, both of which exist because a specific wrong number shipped
+without them:
 
 1. **Ceiling = min(today's trailing P/E, the 5-year median).** The research pass
    returns the range on a machine-readable `PE_RANGE_5Y:` line, because a range
@@ -165,15 +179,59 @@ specific wrong number shipped without them:
    Only ever deflates — assuming margin COMPRESSION does not earn a higher
    multiple.
 
+### When there is no observed range — read this before trusting rule 1
+
+`PE_RANGE_5Y` resolved in **2 of the first 13 generated models**. The prompt was
+unchanged from 2026-08-01 12:41 onward, so this was never a regression: it never
+worked reliably. The calibration sequence below is real, but it was recorded
+almost entirely on runs where the anchor it credits was **absent**, and where
+`ceiling` was therefore just today's trailing multiple with no `min()` against
+anything.
+
 Calibration history, all on the same ticker: **+1038%** (training data) → +212%
 → **+1000%** (the median-only regression) → +328% → +163% → **+77%, no flags**.
+Treat it as the history of the margin-deflation rule, which did apply
+throughout, rather than of the median ceiling, which mostly did not.
+
+Two reasons it went unseen for eleven consecutive models:
+
+- `research()` destructured `{ text, sources }` and threw `finishReason` away.
+  `structure()` checks it and raises a named error on `MAX_TOKENS`; the research
+  pass had no equivalent, so a truncated reply was indistinguishable from a
+  complete one. The `PE_RANGE_5Y` line is the LAST thing the prompt asks for,
+  which makes it the first thing truncation takes — the `thesis` bug with the
+  polarity reversed, an unbounded region in front of the payload rather than
+  behind it.
+- The 24h research cache stores whatever `produce()` returned. One reply without
+  the range pinned that failure to the ticker for the rest of the day.
+
+What happens now:
+
+- `diagnostics.research_finish_reason` records why. If it reads `MAX_TOKENS`,
+  the cause is truncation and the budget needs raising again; if it reads `STOP`,
+  the model simply did not comply and the prompt needs restructuring — most
+  likely splitting the range into its own short grounded call.
+- `maxOutputTokens` is 8192 (was 4096; on 2.5 Flash the dynamic thinking budget
+  competes for the same ceiling) and the prose is capped at 700 words.
+- A result with no range is never reused: the next attempt re-runs the grounded
+  pass rather than inheriting the failure, so every generate gets two real tries.
+- **Trailing P/E above `NO_ANCHOR_PE_MAX` (60x) with no observed range is a hard
+  error.** Not a flag — the endpoint refuses. CCJ regenerated on 2026-08-04 with
+  a market P/E of 153.6x (up from 84.7x the previous day on collapsing TTM
+  earnings), took that as its ceiling, exited the base case at 134.7x and
+  returned **+59.7% with `data_quality: "ok"` and an empty flags array**. Every
+  existing check compared it against the same 153.6x. Cameco has not traded at
+  135x. This is the same choice the file already makes for actuals: when no
+  source answers, error rather than invent.
+- Below that threshold, `no_observed_pe_range` is flagged and the model saves as
+  `warn`.
 
 ### Two Gemini passes
 
 Same shape as the screener — see [DATA_SOURCES.md](DATA_SOURCES.md) for why, and
 for the two schema traps (`required` on every field; no unbounded free-text
 field). Grounded research is cached 24h under
-`valuation-research:v2:TICKER:DATE`; the structuring pass is never cached, so
+`valuation-research:v3:TICKER:DATE`; the structuring pass is never cached, so
 rule edits take effect on the next generate.
 
 The structuring pass retries once on an incomplete response, naming what was
@@ -182,9 +240,9 @@ wrong, rather than discarding a completed grounded search.
 ### Verifying a change here
 
 Regenerate and read `diagnostics`, not the fair value: `field_sources`,
-`split_adjustment`, `fx`, `reconciliation`, `baseline_pe` vs `market_pe`,
-`margin_uplift`, `margin_adjusted_ceiling`, `per_scenario`. A good test set,
-covering every path:
+`split_adjustment`, `fx`, `resolved_symbol`, `reconciliation`, `baseline_pe` vs
+`market_pe`, `pe_range_5y`, `research_finish_reason`, `margin_uplift`,
+`margin_adjusted_ceiling`, `per_scenario`. A good test set, covering every path:
 
 | Ticker | Exercises |
 |---|---|
@@ -192,7 +250,8 @@ covering every path:
 | `MLI` | split AFTER the last 10-K — trap (c) |
 | `V` | mature margins, so the margin deflation should barely bite |
 | `TSM` | 20-F / `ifrs-full`; TWD filings vs a USD ADR — trap (d), loud |
-| `CCJ` | 40-F; CAD filings vs a USD quote — trap (d), quiet enough to pass every flag |
+| `CCJ` | 40-F; CAD filings vs a USD quote — trap (d), quiet enough to pass every flag; also the no-anchor refusal, at 153x |
+| `ASML` | app ticker vs `ASML.AS` — the model must be built on Amsterdam in EUR, not Nasdaq in USD |
 | `NOVO-B` | 20-F / `ifrs-full`, de-rated multiple |
 | `DANSKE` | no SEC presence → timeseries-only path |
 
@@ -210,6 +269,11 @@ positive upside for everything is broken even when nothing throws.
 For a trap (d) ticker also check that `diagnostics.fx.applied` is `true`, that
 `fx.rate` is the right order of magnitude, and that `baseline_pe` now lands near
 `market_pe` — before the fix TSM read 1.3x against 36.5x.
+
+**Check `pe_range_5y` on every run you use to judge a change.** If it is null,
+the ceiling was today's trailing multiple and the run says nothing about
+whether rule 1 works. That is how eleven models in a row were read as evidence
+for a mechanism that had not fired.
 
 ## Valuation models are portfolio-agnostic
 
