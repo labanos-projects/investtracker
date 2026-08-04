@@ -23,6 +23,12 @@
 //       market cap before anything is saved, and buildKnowledgePrompt is gone:
 //       when no source answers, the endpoint now returns an error instead of an
 //       invented model.
+// v16 – ?generate_valuation= and ?yh_symbol= are now two different symbols.
+//       They always were two different things; the endpoint just used one
+//       string for both. The app's ticker is a storage key ("ASML"), the Yahoo
+//       symbol is a listing ("ASML.AS"), and for anything not listed in the US
+//       those name different securities. ASML was being valued on Nasdaq in USD
+//       while every other number on its page came from Amsterdam in EUR.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
@@ -67,7 +73,25 @@ export default {
       const refresh      = url.searchParams.get('refresh') === '1';
 
       try {
-        const symbol = genTicker.toUpperCase().trim();
+        // ── Two symbols, and they are not interchangeable ──
+        //
+        //   storeAs — the app's own ticker ("ASML", "NOVO-B"). This is the
+        //             STORAGE key: valuation_models is unique on
+        //             (ticker, model_date) and the panel loads by
+        //             ?ticker=<display ticker>, so writing anything else here
+        //             orphans the model.
+        //   symbol  — the Yahoo listing ("ASML.AS", "NOVO-B.CO"). This is the
+        //             RESOLUTION key: it decides which exchange, which price
+        //             and therefore which CURRENCY the model is built in.
+        //
+        // Using one string for both is why ASML was valued on Nasdaq in USD
+        // against a page quoting Amsterdam in EUR — and why regenerating GMAB
+        // would have resolved Genmab's US ADR. The fallback keeps an
+        // un-migrated caller (or a bookmarked URL) behaving exactly as before.
+        const storeAs  = genTicker.toUpperCase().trim();
+        const yhParam  = (url.searchParams.get('yh_symbol') || '').toUpperCase().trim();
+        const symbol   = yhParam || storeAs;
+
         const result = await generateValuation(symbol, env, { currentPrice, portfolioId, refresh });
 
         // Inputs failed to reconcile with the market. Refusing to save is the
@@ -82,6 +106,19 @@ export default {
             diagnostics: result.diagnostics,
             inputs_preview: result.inputs_preview,
           }), { status: 422, headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
+
+        // Built against the listing, filed under the app's ticker. Recorded in
+        // diagnostics rather than inferred later: "which listing is this model
+        // actually about" is not answerable from the stored row otherwise, and
+        // that ambiguity is the whole bug.
+        //
+        // `result.diagnostics` IS `result.payload.diagnostics` — same object —
+        // so this reaches the database. Do it before the save, not after.
+        result.payload.ticker = storeAs;
+        if (result.diagnostics) {
+          result.diagnostics.resolved_symbol = symbol;
+          result.diagnostics.stored_as = storeAs;
         }
 
         const saveRes = await fetch('https://labanos.dk/valuations.php', {
