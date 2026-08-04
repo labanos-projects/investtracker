@@ -23,6 +23,7 @@
 //   SEC EDGAR companyfacts  → audited, us-gaap AND ifrs-full
 //   Yahoo fundamentals-timeseries → gap-fill, and the only path for non-SEC names
 //   Yahoo quoteSummary      → live price, market cap, trailing P/E
+//   Yahoo `<PAIR>=X` chart  → spot FX, when the filing and the quote disagree
 //
 // ── The reconciliation gate ──
 //
@@ -33,7 +34,7 @@
 // catches the entire NOW class of failure, because a 5:1 split shows up as a
 // ratio of 5.0 and nothing else does.
 //
-// ── XBRL: three traps, all of which produce confident wrong numbers ──
+// ── XBRL: four traps, all of which produce confident wrong numbers ──
 //
 // This file parses SEC companyfacts, as `edgarFacts()` in screener_data.js
 // does, and applies the same first two fixes. They are duplicated deliberately
@@ -41,8 +42,10 @@
 // tags a DCF needs and rewriting it wholesale to add them is a larger blast
 // radius than 30 lines of parsing. If you change the period-keying or the
 // split-scoping HERE, change it THERE too — both produce silent wrong numbers,
-// not errors. The third trap is valuation-only, because only a DCF cares about
-// a share count more recent than the last annual report.
+// not errors. The third and fourth traps are valuation-only: only a DCF cares
+// about a share count more recent than the last annual report, and only a DCF
+// divides a filed earnings figure by a share count and compares the result to
+// a market price.
 //
 //   (a) `fy` is the fiscal year of the REPORT, not of the data point. One NVDA
 //       10-K carries three annual periods all tagged fy=2025. Key on the
@@ -52,6 +55,9 @@
 //       counts therefore come from the latest accession's own comparatives.
 //   (c) A split can happen AFTER the last annual report, leaving the 10-K
 //       self-consistent and stale. See splitFactorSinceAnnual below.
+//   (d) A company can REPORT in one currency and TRADE in another. See
+//       resolveFx below — this is the ADR trap, and it is the one that hides
+//       best, because for EUR or CAD it lands inside every sanity threshold.
 // ────────────────────────────────────────────────────────────────────────
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
@@ -123,6 +129,13 @@ const TAGS = {
 // Split-restated quantities: scope to a single filing. See trap (b) above.
 const SPLIT_SENSITIVE = new Set(['shares']);
 
+// Everything that is an amount OF MONEY, and therefore has to be translated
+// when the filing currency and the quote currency differ. `shares` is
+// deliberately absent — a share count is a count, and multiplying it by an FX
+// rate is exactly the kind of plausible, confident, wrong number this file
+// exists to prevent.
+const MONEY_FIELDS = ['revenue', 'gross_profit', 'op_income', 'net_income'];
+
 // ─── Trap (c): a split that happens AFTER the last annual report ──────────────
 //
 // Scoping share counts to one filing fixes splits the latest 10-K has already
@@ -165,6 +178,72 @@ function splitFactorSinceAnnual(allRows, annualBasis) {
   if (Math.abs(ratio - 1) <= SPLIT_TOLERANCE) return 1;
   for (const c of SPLIT_RATIOS) if (Math.abs(ratio / c - 1) <= SPLIT_TOLERANCE) return c;
   return 1;
+}
+
+// ─── Trap (d): the filing currency is not the quote currency ─────────────────
+//
+// `resolveValuationInputs` has always returned `currency` (from the filing) and
+// `quote_currency` (from the quote) as separate fields, with a comment saying
+// they can differ. Nothing ever converted between them. The DCF computes
+// terminal EPS as net_income / shares — reporting currency — multiplies by an
+// exit multiple, and compares the result to a price in the QUOTE currency. For
+// an ADR that comparison is off by the exchange rate, in full.
+//
+// TSMC is the worked example, and it is worked because it was loud: the 20-F
+// reports TWD, the ADR trades USD, and the model returned a fair value of
+// 13,421 against a price of 416 — a "+3122% upside" with a baseline P/E of
+// 1.3x against a market 36.5x. That one was caught by
+// `baseline_pe_diverges_from_market` on the next generate.
+//
+// The reason this is a gate and not a nice-to-have is the QUIET cases. ASML
+// reports EUR and trades USD; Cameco reports CAD and trades USD. Both are
+// wrong by 15-40%, which is inside every threshold in valuation_model.js, and
+// both shipped as `data_quality: "ok"` with an empty flags array. CCJ's stored
+// +31% upside was really about +3%. Nothing in the output said so.
+//
+// Note what does NOT need fixing: the ADR ratio. Yahoo reports
+// `dilutedAverageShares` for an ADR symbol on an ADS basis (TSM: 5,186M, i.e.
+// 25,930M ordinary / 5), and market cap and price are both per-ADS, so the
+// reconciliation gate reads ~1.00 and the ratio cancels out of EPS. FX is the
+// whole of the discrepancy. If a filer ever resolves shares from EDGAR on an
+// ORDINARY basis while quoting as an ADR, reconciliation will read 0.2 and
+// block it — which is the correct outcome, not a second thing to patch here.
+//
+// Yahoo rather than Frankfurter, deliberately: Frankfurter serves ECB
+// reference rates, and the ECB does not publish TWD. The pair that broke this
+// is the pair Frankfurter cannot answer.
+const FX_TOLERANCE_MIN = 1e-6;
+const FX_TOLERANCE_MAX = 1e6;
+
+async function fxSpot(pair, refresh) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(pair)}?range=1d&interval=1d`;
+  const d = await cachedJson(url, { headers: { 'User-Agent': BROWSER_UA } },
+    { ttl: TTL.FX, ms: 10000, refresh, key: `fx:${pair}` });
+  const meta = d?.chart?.result?.[0]?.meta;
+  const rate = meta?.regularMarketPrice ?? meta?.previousClose ?? null;
+  return (typeof rate === 'number' && isFinite(rate) && rate > 0) ? rate : null;
+}
+
+/**
+ * Multiplier that turns an amount in `from` into an amount in `to`.
+ *
+ * Tries the direct pair first and falls back to the inverse, because Yahoo
+ * carries `TWDUSD=X` and `USDTWD=X` with different liquidity and either may be
+ * the stale one. Returns null when neither answers — the caller MUST treat
+ * that as fatal rather than defaulting to 1, which is the bug this exists to
+ * fix wearing a different hat.
+ */
+async function resolveFx(from, to, refresh) {
+  if (!from || !to || from === to) return { rate: 1, pair: null };
+  const direct = await fxSpot(`${from}${to}=X`, refresh).catch(() => null);
+  if (direct && direct > FX_TOLERANCE_MIN && direct < FX_TOLERANCE_MAX) {
+    return { rate: direct, pair: `${from}${to}=X` };
+  }
+  const inverse = await fxSpot(`${to}${from}=X`, refresh).catch(() => null);
+  if (inverse && inverse > FX_TOLERANCE_MIN && inverse < FX_TOLERANCE_MAX) {
+    return { rate: 1 / inverse, pair: `${to}${from}=X (inverted)` };
+  }
+  return { rate: null, pair: null };
 }
 
 export async function valuationFacts(cik, refresh = false) {
@@ -281,7 +360,8 @@ const toM = v => (typeof v === 'number' && isFinite(v)) ? v / 1e6 : null;
  * Everything the valuation prompt and the saved model need, resolved from
  * filings with per-field provenance.
  *
- * Throws only when NOTHING resolved. A partial answer is still useful — the
+ * Throws only when NOTHING resolved, or when the figures cannot be expressed in
+ * the currency the shares trade in. A partial answer is still useful — the
  * caller decides whether the gaps are tolerable — but a model with no actuals
  * has nothing to stand on and must not reach Gemini, because Gemini will
  * cheerfully invent the missing years.
@@ -336,6 +416,39 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
     if (any) rows.push(row);
   }
 
+  // ── Trap (d): translate the filings into the currency the shares trade in ──
+  //
+  // Done HERE, on the rows, before anything downstream sees them, so that
+  // `actuals`, `history`, the Gemini prompt, the stored model and the frontend
+  // all speak one currency and the DCF's EPS-vs-price comparison is coherent by
+  // construction. Everything below this point can assume `reportCcy` is gone.
+  //
+  // Spot, not a per-year historical rate: the projection compounds ratios off
+  // the Y0 baseline and the exit multiple is applied to terminal EPS, so it is
+  // the CURRENT rate that has to line up with the CURRENT price. Restating a
+  // seven-year history at seven different rates would make the growth rates the
+  // model reads mean something other than the growth the company reported.
+  const reportCcy = edgar?.currency || (marketOk ? summary.currency : null) || 'USD';
+  const quoteCcy = marketOk ? summary.currency : null;
+  const needsFx = !!(quoteCcy && reportCcy && quoteCcy !== reportCcy);
+
+  let fx = { rate: 1, pair: null };
+  if (needsFx) {
+    fx = await resolveFx(reportCcy, quoteCcy, refresh);
+    if (!fx.rate) {
+      throw new Error(
+        `${symbol} reports in ${reportCcy} but trades in ${quoteCcy}, and no ${reportCcy}/${quoteCcy} ` +
+        `rate could be resolved. Refusing to value ${reportCcy} earnings against a ${quoteCcy} price.`
+      );
+    }
+    for (const row of rows) {
+      for (const f of MONEY_FIELDS) {
+        if (row[f] !== null && row[f] !== undefined) row[f] = row[f] * fx.rate;
+      }
+    }
+  }
+  const currency = needsFx ? quoteCcy : reportCcy;
+
   // Keep the last 7 fiscal years: 3 become the Y-2/Y-1/Y0 baseline, the rest
   // give the model (and the chart) a trend to reason about.
   const history = rows.slice(-7);
@@ -366,11 +479,20 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
   if (splitAdj !== 1 && sources.shares) {
     sources.shares = `${sources.shares}(split-adjusted ${splitAdj}x)`;
   }
+  if (needsFx) {
+    for (const f of MONEY_FIELDS) {
+      if (sources[f]) sources[f] = `${sources[f]}(${reportCcy}→${quoteCcy})`;
+    }
+  }
 
   // ── Reconciliation against the market ──────────────────────────────────────
   // The check that would have stopped the ServiceNow model. Everything above
   // can be individually plausible and still collectively wrong; this compares
   // the result against a number nobody had to derive.
+  //
+  // Untouched by the FX conversion above, and that is the point: market cap,
+  // price and share count are all already on the quote basis (for an ADR,
+  // per-ADS), so the ratio was never the thing that was broken.
   const impliedShares = (marketOk && summary.mktcap_native && summary.price)
     ? summary.mktcap_native / summary.price / 1e6
     : null;
@@ -415,11 +537,15 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
     company: marketOk ? summary.longName : null,
     sector: marketOk ? summary.sector : null,
     industry: marketOk ? summary.industry : null,
-    // Reporting currency comes from the filing, NOT from the quote: a company
-    // can report in one currency and trade in another (Novo reports DKK; the
-    // ADR trades USD). Getting this backwards scales the whole model.
-    currency: edgar?.currency || (marketOk ? summary.currency : 'USD'),
-    quote_currency: marketOk ? summary.currency : null,
+    // The currency EVERY figure above is now expressed in. When the filing and
+    // the quote disagree this is the QUOTE currency, because that is the
+    // currency the price the model is judged against is quoted in. The filing's
+    // own currency is preserved separately for provenance — see trap (d).
+    currency,
+    reporting_currency: reportCcy,
+    quote_currency: quoteCcy,
+    fx_rate: needsFx ? fx.rate : null,
+    fx_pair: needsFx ? fx.pair : null,
     price: marketOk ? summary.price : null,
     mktcap_native: marketOk ? summary.mktcap_native : null,
     pe_trailing: marketOk ? summary.pe_trailing : null,
@@ -439,6 +565,13 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
       market_err: summary?._err || null,
       field_sources: sources,
       split_adjustment: splitAdj,
+      fx: {
+        reporting_currency: reportCcy,
+        quote_currency: quoteCcy,
+        applied: needsFx,
+        rate: needsFx ? fx.rate : 1,
+        pair: needsFx ? fx.pair : null,
+      },
       years_resolved: history.map(r => r.fiscal_year),
       reconciliation: recon.status,
       refresh,
