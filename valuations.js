@@ -42,39 +42,98 @@ function calcScenarioFV(sc, projRows) {
   return { fv, buyTarget: fv * (1 - Number(sc.mos || 0.20)), termEPS };
 }
 
-// ─── NewsPanel ─────────────────────────────────────────────────────
+// ─── NewsPanel ─────────────────────────────────────────────────────────────
+//
+// Two buckets, because the worker now tells them apart.
+//
+//   news     — articles that name THIS company. The list proper.
+//   related  — articles that name a peer or the sector but not the company.
+//              Collapsed by default: "Lilly beats on Q2" is worth having on a
+//              Novo page, but it is not Novo news and must not pretend to be.
+//
+// Anything matching neither is already gone before it reaches us. That is the
+// fix for the panel that used to show Tibetan antelopes under NOVO-B.CO — the
+// filtering belongs next to the resolution, in cloudflare/news.js, not here.
 const NEWS_PREVIEW = 5;
 
-function NewsPanel({ yhTicker }) {
-  const [news,     setNews]     = useState(null);  // null = loading
-  const [error,    setError]    = useState(false);
-  const [expanded, setExpanded] = useState(false);
+function NewsPanel({ yhTicker, company }) {
+  const [data,        setData]        = useState(null);  // null = loading
+  const [error,       setError]       = useState(null);
+  const [expanded,    setExpanded]    = useState(false);
+  const [showRelated, setShowRelated] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    setNews(null); setError(false); setExpanded(false);
-    fetch(`${WORKER_URL}?news=${encodeURIComponent(yhTicker)}`)
+    setData(null); setError(null); setExpanded(false); setShowRelated(false);
+
+    // The company name goes with the request. The page already has it, and it
+    // is the query the worker gets the most out of — resolution should not
+    // depend on a quoteSummary round-trip we can spare it.
+    const params = new URLSearchParams({ news: yhTicker });
+    if (company) params.set('name', company);
+
+    fetch(`${WORKER_URL}?${params}`)
       .then(r => r.json())
-      .then(d => { if (!cancelled) setNews(d.news || []); })
-      .catch(() => { if (!cancelled) setError(true); });
+      .then(d => {
+        if (cancelled) return;
+        if (d.error && !(d.news || []).length) setError(d.error);
+        else setData(d);
+      })
+      .catch(() => { if (!cancelled) setError('network'); });
     return () => { cancelled = true; };
-  }, [yhTicker]);
+  }, [yhTicker, company]);
 
   const timeAgo = (unix) => {
+    if (!unix) return '';
     const diff = Math.floor((Date.now() / 1000) - unix);
     if (diff < 3600)  return Math.floor(diff / 60) + 'm ago';
     if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
     return Math.floor(diff / 86400) + 'd ago';
   };
 
-  const visible = news ? (expanded ? news : news.slice(0, NEWS_PREVIEW)) : [];
-  const hasMore = news && news.length > NEWS_PREVIEW;
+  const news    = data?.news || [];
+  const related = data?.related || [];
+  const visible = expanded ? news : news.slice(0, NEWS_PREVIEW);
+  const hasMore = news.length > NEWS_PREVIEW;
+
+  const Row = ({ item, dim, last }) => (
+    <a href={item.link} target="_blank" rel="noopener noreferrer"
+      className={`flex gap-3 items-start px-4 py-3 hover:bg-gray-50 transition-colors group ${last ? '' : 'border-b border-gray-100'}`}>
+      {item.thumbnail && (
+        <img src={item.thumbnail} alt="" className={`w-12 h-12 rounded-lg object-cover shrink-0 mt-0.5 bg-gray-100 ${dim ? 'opacity-60' : ''}`} />
+      )}
+      <div className="flex-1 min-w-0">
+        <p className={`text-[13px] font-medium leading-snug group-hover:text-blue-700 transition-colors line-clamp-2 ${dim ? 'text-gray-500' : 'text-gray-800'}`}>
+          {item.title}
+        </p>
+        <div className="flex items-center gap-2 mt-1">
+          <span className="text-[11px] text-gray-400">{item.publisher}</span>
+          {item.time && <><span className="text-gray-300 text-[10px]">·</span>
+          <span className="text-[11px] text-gray-400 mono">{timeAgo(item.time)}</span></>}
+        </div>
+      </div>
+      <span className="text-gray-300 group-hover:text-gray-400 text-[13px] shrink-0 mt-0.5 transition-colors">↗</span>
+    </a>
+  );
 
   return (
     <div className="mx-4 mb-6">
-      <h2 className="text-[13px] font-semibold text-gray-600 uppercase tracking-wide mb-2">News</h2>
+      <div className="flex items-baseline justify-between mb-2">
+        <h2 className="text-[13px] font-semibold text-gray-600 uppercase tracking-wide">News</h2>
+        {/* What the worker decided this ticker IS. A wrong resolution is the
+            one failure this panel cannot detect on its own, so it says so
+            out loud rather than silently listing someone else's news. */}
+        {data?.resolved?.company && (
+          <span className="text-[10px] text-gray-400 truncate ml-3">
+            {data.resolved.company}
+            {data.resolved.symbol && data.resolved.symbol !== yhTicker && (
+              <span className="mono"> · {data.resolved.symbol}</span>
+            )}
+          </span>
+        )}
+      </div>
 
-      {news === null && !error && (
+      {data === null && !error && (
         <div className="flex items-center gap-2 text-gray-400 text-[13px] py-4">
           <svg className="spin w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
@@ -87,34 +146,17 @@ function NewsPanel({ yhTicker }) {
         <div className="text-[13px] text-gray-400 py-4">Could not load news.</div>
       )}
 
-      {news && news.length === 0 && (
+      {data && news.length === 0 && (
         <div className="bg-white rounded-xl border border-gray-100 shadow-sm px-4 py-6 text-center text-gray-400 text-sm">
-          No recent news found.
+          No recent news found for {data.resolved?.company || yhTicker}.
         </div>
       )}
 
-      {news && news.length > 0 && (
+      {news.length > 0 && (
         <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
           {visible.map((item, i) => (
-            <a key={i} href={item.link} target="_blank" rel="noopener noreferrer"
-              className={`flex gap-3 items-start px-4 py-3 hover:bg-gray-50 transition-colors group ${i < visible.length - 1 || hasMore ? 'border-b border-gray-100' : ''}`}>
-              {item.thumbnail && (
-                <img src={item.thumbnail} alt="" className="w-12 h-12 rounded-lg object-cover shrink-0 mt-0.5 bg-gray-100" />
-              )}
-              <div className="flex-1 min-w-0">
-                <p className="text-[13px] text-gray-800 font-medium leading-snug group-hover:text-blue-700 transition-colors line-clamp-2">
-                  {item.title}
-                </p>
-                <div className="flex items-center gap-2 mt-1">
-                  <span className="text-[11px] text-gray-400">{item.publisher}</span>
-                  <span className="text-gray-300 text-[10px]">·</span>
-                  <span className="text-[11px] text-gray-400 mono">{timeAgo(item.time)}</span>
-                </div>
-              </div>
-              <span className="text-gray-300 group-hover:text-gray-400 text-[13px] shrink-0 mt-0.5 transition-colors">↗</span>
-            </a>
+            <Row key={item.link || i} item={item} last={i === visible.length - 1 && !hasMore} />
           ))}
-
           {hasMore && (
             <button onClick={() => setExpanded(e => !e)}
               className="w-full px-4 py-2.5 text-[12px] text-blue-500 hover:text-blue-700 hover:bg-blue-50 transition-colors flex items-center justify-center gap-1 font-medium">
@@ -122,6 +164,24 @@ function NewsPanel({ yhTicker }) {
                 ? <>Show less <span className="text-[10px]">▲</span></>
                 : <>Show {news.length - NEWS_PREVIEW} more <span className="text-[10px]">▼</span></>}
             </button>
+          )}
+        </div>
+      )}
+
+      {/* Sector and peer coverage, one click away and visually subordinate. */}
+      {related.length > 0 && (
+        <div className="mt-2">
+          <button onClick={() => setShowRelated(s => !s)}
+            className="text-[11px] text-gray-400 hover:text-gray-600 transition-colors flex items-center gap-1">
+            <span className="text-[9px]">{showRelated ? '▲' : '▼'}</span>
+            {related.length} related {related.length === 1 ? 'story' : 'stories'} in the sector
+          </button>
+          {showRelated && (
+            <div className="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden mt-1.5">
+              {related.map((item, i) => (
+                <Row key={item.link || i} item={item} dim last={i === related.length - 1} />
+              ))}
+            </div>
           )}
         </div>
       )}
