@@ -158,7 +158,7 @@ const FLAG_TEXT = {
     'The last full fiscal year is 9+ months old — results reported since it closed are not in the baseline.',
 };
 
-function ValuationQualityBanner({ model }) {
+function ValuationQualityBanner({ model, pageCurrency }) {
   const [open, setOpen] = React.useState(false);
 
   const flags   = Array.isArray(model.flags) ? model.flags : [];
@@ -166,12 +166,19 @@ function ValuationQualityBanner({ model }) {
   const legacy  = !model.data_quality && LEGACY_TRAINING_RE.test(model.notes || '');
   const manual  = !model.data_quality && !legacy;
 
+  // The model is denominated in whatever currency the generator resolved. When
+  // that disagrees with the currency this page is quoting, the fair value and
+  // the price are not comparable and no percentage between them means anything.
+  // Say so — this is a units error, and units errors are the one class this
+  // panel has consistently rendered as a confident number.
+  const ccyMismatch = !!(model.currency && pageCurrency && model.currency !== pageCurrency);
+
   // A clean generated model and a hand-built one both earn silence. Only
   // something actually worth knowing gets a banner.
-  if (!legacy && !flags.length && !diag) return null;
-  if (manual && !flags.length && !diag) return null;
+  if (!legacy && !flags.length && !diag && !ccyMismatch) return null;
+  if (manual && !flags.length && !diag && !ccyMismatch) return null;
 
-  const tone = (legacy || flags.length)
+  const tone = (legacy || flags.length || ccyMismatch)
     ? { box: 'bg-amber-50 border-amber-200', text: 'text-amber-800', sub: 'text-amber-700', icon: '⚠' }
     : { box: 'bg-gray-50 border-gray-200',   text: 'text-gray-600',  sub: 'text-gray-500',  icon: '✓' };
 
@@ -185,8 +192,21 @@ function ValuationQualityBanner({ model }) {
       <div className="flex items-start gap-2">
         <span className={`text-[12px] leading-4 ${tone.text}`}>{tone.icon}</span>
         <div className="flex-1 min-w-0">
-          {legacy && (
+          {ccyMismatch && (
             <div className={`text-[11px] font-semibold ${tone.text}`}>
+              Currency mismatch — model in {model.currency}, page quoting {pageCurrency}
+            </div>
+          )}
+          {ccyMismatch && (
+            <div className={`text-[10px] ${tone.sub} leading-relaxed mt-0.5`}>
+              This model was built against a different listing than the one priced above, so the
+              upside below is measured against the model’s own price rather than the page’s.
+              Regenerate to rebuild it on the listing you hold.
+            </div>
+          )}
+
+          {legacy && (
+            <div className={`text-[11px] font-semibold ${tone.text} ${ccyMismatch ? 'mt-1.5' : ''}`}>
               Unverified — built from recalled financials, not filings
             </div>
           )}
@@ -198,12 +218,12 @@ function ValuationQualityBanner({ model }) {
           )}
 
           {flags.map(f => (
-            <div key={f} className={`text-[10px] ${tone.sub} leading-relaxed ${legacy ? 'mt-1' : ''}`}>
+            <div key={f} className={`text-[10px] ${tone.sub} leading-relaxed ${(legacy || ccyMismatch) ? 'mt-1' : ''}`}>
               {FLAG_TEXT[f] || f}
             </div>
           ))}
 
-          {!legacy && !flags.length && diag && (
+          {!legacy && !ccyMismatch && !flags.length && diag && (
             <div className={`text-[10px] ${tone.sub}`}>Actuals resolved from filings; sanity checks passed.</div>
           )}
 
@@ -218,6 +238,18 @@ function ValuationQualityBanner({ model }) {
             <div className="mt-1.5 space-y-0.5">
               {srcLabel && (
                 <div className="text-[10px] text-gray-500 mono break-words">{srcLabel}</div>
+              )}
+              {diag.resolved_symbol && (
+                <div className="text-[10px] text-gray-500 mono">
+                  resolved from {diag.resolved_symbol}
+                  {diag.stored_as && diag.stored_as !== diag.resolved_symbol ? ` · stored as ${diag.stored_as}` : ''}
+                </div>
+              )}
+              {diag.fx?.applied && (
+                <div className="text-[10px] text-gray-500 mono">
+                  {diag.fx.reporting_currency} → {diag.fx.quote_currency} at {diag.fx.rate}
+                  {diag.fx.pair ? ` (${diag.fx.pair})` : ''}
+                </div>
               )}
               {diag.baseline_pe != null && diag.market_pe != null && (
                 <div className="text-[10px] text-gray-500 mono">
@@ -254,7 +286,14 @@ function ValuationQualityBanner({ model }) {
 }
 
 // ─── ValuationPanel component ─────────────────────────────────────────
-function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onRequireLogin }) {
+//
+// `ticker` and `yhTicker` are not interchangeable and the panel needs both.
+// `ticker` is the storage key — valuation_models is keyed on it and loadModel
+// looks up by it. `yhTicker` is the LISTING, which decides the exchange, the
+// price and therefore the currency the entire model is denominated in. The
+// panel used to send only `ticker`, so ASML.AS in EUR on this page was valued
+// as bare ASML on Nasdaq in USD.
+function ValuationPanel({ ticker, yhTicker, portfolioId, currentPrice, currency, user, onRequireLogin }) {
   const { useState, useEffect, useCallback } = React;
   const [model,      setModel]     = useState(null);
   const [loading,    setLoading]   = useState(true);
@@ -356,7 +395,13 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
     setGenError(null);
     try {
       const params = new URLSearchParams({
+        // Storage key. The worker writes valuation_models.ticker from this, so
+        // it must stay the app's ticker or loadModel above will never find the
+        // row it just wrote.
         generate_valuation: ticker,
+        // Resolution key. This is what actually gets looked up on Yahoo, and
+        // therefore which exchange, price and currency the model is built on.
+        yh_symbol:          yhTicker || ticker,
         portfolio_id:       portfolioId,
         current_price:      currentPrice || 0,
       });
@@ -422,12 +467,34 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
   if (blendedWt > 0) blendedFV /= blendedWt;
   const baseMOS      = Number(sdMap['base']?.sc?.mos || 0.20);
   const blendedBuy   = blendedFV * (1 - baseMOS);
-  const upside       = currentPrice > 0 ? (blendedFV - currentPrice) / currentPrice : null;
+
+  // ── Which currency is this fair value actually in? ────────────────────────
+  //
+  // `blendedFV` is derived from the model's own actuals, so it is in
+  // `model.currency` — whatever valuation_data.js resolved, which for a company
+  // that reports in one currency and trades in another is the QUOTE currency of
+  // the listing that was valued. It is NOT necessarily the currency this page
+  // is quoting, and the panel used to assume it was: it labelled the fair value
+  // with the page's `currency` prop and divided it by the page's price.
+  //
+  // ASML shipped exactly that. Model in USD (fair value 2,322, built against a
+  // $1,706 Nasdaq price), page in EUR (€1,473) — rendered as "2,322 EUR" and
+  // "+57.7%", against the model's own diagnostics.upside of +36.8%.
+  //
+  // So: always label with the model's currency, and when the two disagree
+  // measure the upside against the price the model was actually built against
+  // rather than dividing by a number in a different unit. The live page price
+  // is preferred when they agree, because it is fresher.
+  const modelCcy    = model.currency || currency;
+  const modelPrice  = Number(sdMap['base']?.sc?.current_price) || Number(model.scenarios[0]?.current_price) || null;
+  const ccyMismatch = !!(model.currency && currency && model.currency !== currency);
+  const priceRef    = ccyMismatch ? modelPrice : ((currentPrice > 0 ? currentPrice : modelPrice));
+  const upside      = priceRef > 0 ? (blendedFV - priceRef) / priceRef : null;
 
   // Formatting helpers
   const f0 = v => v == null ? '—' : v.toLocaleString('en', {minimumFractionDigits:0, maximumFractionDigits:0});
   const f2 = v => v == null ? '—' : v.toLocaleString('en', {minimumFractionDigits:2, maximumFractionDigits:2});
-  const fv_fmt = v => v >= 100 ? f0(v) : f2(v);
+  const fv_fmt = v => v == null ? '—' : (v >= 100 ? f0(v) : f2(v));
   const pct_fmt = v => v == null ? '—' : `${v >= 0 ? '+' : ''}${(v*100).toFixed(1)}%`;
   const rev_fmt = v => v >= 1e6 ? `${(v/1e6).toFixed(1)}T` : v >= 1e3 ? `${(v/1e3).toFixed(0)}B` : `${v.toFixed(0)}M`;
   const p_fmt   = v => v == null || isNaN(v) ? '—' : `${(v*100).toFixed(1)}%`;
@@ -506,7 +573,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
       </div>
 
       {/* ── Provenance / sanity banner — above the number it qualifies ── */}
-      <ValuationQualityBanner model={model} />
+      <ValuationQualityBanner model={model} pageCurrency={currency} />
 
       {/* ── Edit Y0 Actuals (collapsible) ── */}
       {editMode && (
@@ -534,7 +601,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
           <div>
             <div className="text-[10px] text-gray-400 mb-0.5 uppercase tracking-wide">Blended Fair Value</div>
             <div className="text-[22px] font-bold text-gray-900 mono">
-              {fv_fmt(blendedFV)} <span className="text-[12px] font-normal text-gray-400">{currency}</span>
+              {fv_fmt(blendedFV)} <span className="text-[12px] font-normal text-gray-400">{modelCcy}</span>
             </div>
             <div className="text-[11px] text-gray-400 mt-0.5">
               Buy target: <span className="mono font-medium text-gray-700">{fv_fmt(blendedBuy)}</span>
@@ -546,7 +613,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
             <div className={`text-[20px] font-bold mono ${(upside||0) >= 0 ? 'text-emerald-500' : 'text-red-500'}`}>
               {upside != null ? pct_fmt(upside) : '—'}
             </div>
-            <div className="text-[11px] text-gray-400 mono">{fv_fmt(currentPrice)} {currency}</div>
+            <div className="text-[11px] text-gray-400 mono">{fv_fmt(priceRef)} {modelCcy}</div>
           </div>
         </div>
       </div>
@@ -556,7 +623,7 @@ function ValuationPanel({ ticker, portfolioId, currentPrice, currency, user, onR
         {['bear','base','bull'].map(key => {
           const sd = sdMap[key]; if (!sd) return null;
           const { sc, fv, buyTarget } = sd;
-          const scUpside = currentPrice > 0 ? (fv - currentPrice) / currentPrice : null;
+          const scUpside = priceRef > 0 ? (fv - priceRef) / priceRef : null;
           const isActive = expanded && activeTab === key;
           return (
             <div key={key}
