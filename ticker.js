@@ -1,4 +1,4 @@
-// ─── ticker.js — the shared company page ────────────────────────────────────
+// ─── ticker.js — the shared company page ────────────────────────────────
 //
 // One page per company, reachable from Holdings, Watchlist and Screener.
 // Previously the rich view (chart, news, valuation, notes) existed only for
@@ -70,7 +70,7 @@ function TickerPage({
     return n(v, 0);
   })();
 
-  // ── Transactions (holdings only) ─────────────────────────────────────────
+  // ── Transactions (holdings only) ────────────────────────────────────
   const [txns,         setTxns]         = useState(initialTxns || []);
   const [addingTxn,    setAddingTxn]    = useState(false);
   const [editingTxnId, setEditingTxnId] = useState(null);
@@ -165,7 +165,7 @@ function TickerPage({
     }
   };
 
-  // ── Notes ────────────────────────────────────────────────────────────────
+  // ── Notes ─────────────────────────────────────────────────────────
   // Ticker-scoped (see notes.php): a note written from the screener must still
   // be there when the company later becomes a holding.
   const [notes,      setNotes]      = useState([]);
@@ -245,7 +245,7 @@ function TickerPage({
     } catch (_) { setNoteError('Could not delete — check your connection.'); }
   };
 
-  // ── Add to watchlist / portfolio (un-held tickers) ───────────────────────
+  // ── Add to watchlist / portfolio (un-held tickers) ──────────────────────
   const [showWlModal, setShowWlModal] = useState(false);
   const [showPfModal, setShowPfModal] = useState(false);
   const [wlAdded,     setWlAdded]     = useState(false);
@@ -411,7 +411,7 @@ function TickerPage({
       />
 
       {/* ── News ── */}
-      <NewsPanel yhTicker={yhTicker} />
+      <NewsPanel yhTicker={yhTicker} company={company} />
 
       {/* ── Transactions (holdings only) ── */}
       {isHolding && (
