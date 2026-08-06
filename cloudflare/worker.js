@@ -36,11 +36,6 @@
 //       Novo Nordisk's news. NOVO-B returned empty; only bare US-resolvable
 //       symbols ever worked, which is to say: every non-US holding was broken.
 //
-//       Correcting the identifier was necessary and not sufficient. Querying
-//       NVO, the symbol that does work, the ZEUS ziltivekimab failure that took
-//       the stock down 9.3% and erased $30bn on 31 July was already outside
-//       newsCount=10 by 3 August. Depth is a second, independent defect.
-//
 //       news.js now resolves the listing to a company identity (name, sibling
 //       listings, sector, peers), fans out across several queries, and drops
 //       every article that matches neither the company nor its sector.
@@ -49,39 +44,43 @@
 //       used `new Date()` — the moment the fetch resolved — under the label
 //       "Prices as of". Every quote therefore looked current, including the
 //       twenty US holdings that do not trade at all before 15:30 CET and sit
-//       frozen at yesterday's close all morning. "Stuck prices" and "working
-//       correctly, market shut" were indistinguishable from the UI.
+//       frozen at yesterday's close all morning.
+// v19 – capped edge caching at 60s. Achieved nothing.
+// v20 – added a minute-bucketed cache buster. Also achieved nothing.
+// v21 – ?symbols=SYM&diag=1, and with it the answer both previous attempts
+//       lacked. Probing from two colos at once:
 //
-//       regularMarketTime was already present in the chart `meta` both paths
-//       parse; it was simply discarded. It is now passed through, with
-//       exchangeTimezoneName so the client can name the market. A symbol whose
-//       timestamp is missing returns null and must render as unknown — never
-//       as now.
+//         CPH   chart 200, cf-cache MISS, age 1, date now, 32,969 bytes,
+//               regularMarketTime 376 MINUTES old
+//         IAD   chart 200, cf-cache MISS, age 1, date now, 38,999 bytes,
+//               regularMarketTime 1 minute old
 //
-//       Nothing about price or change% changed. prevClose is still the last
-//       candle that is not today in Copenhagen.
-// v19 – cap edge caching of Yahoo responses at 60 seconds. A Worker's outbound
-//       fetch() is cached at the colo that ran it, honouring whatever cache
-//       headers the origin sent, and this file never set a TTL.
-// v20 – v19 did not work: cacheTtl applies when Cloudflare STORES a response,
-//       so entries already held kept their original lifetime. Added a
-//       minute-bucketed cache buster so each minute gets its own key.
+//       A genuine cache miss, a freshly generated response, and stale content
+//       inside it. Different byte counts, so genuinely different payloads. The
+//       staleness was never in any cache we control — Yahoo's own header says
+//       `max-age=10`, which could not hold anything for five hours. Yahoo's
+//       Copenhagen edge simply stopped refreshing at ~09:40 and kept serving
+//       one snapshot.
 //
-//       That did not work either, and the reason matters. Probing symbols the
-//       app had never requested — ORSTED.CO, VWS.CO, SAP.DE — returned data
-//       pinned to the same ~09:40 boundary as everything else, across three
-//       exchanges. A per-URL cache cannot do that. Whatever is serving this
-//       region is serving a frozen view of the entire dataset.
-// v21 – so stop guessing and look. Every upstream failure here is swallowed:
-//       `if (!res.ok) continue`, bare `catch {}`. A 429, Yahoo's 999 rate-limit
-//       code, a timeout and a parse error are all indistinguishable from the
-//       outside, which is exactly the information needed to explain why one
-//       region goes stale while another does not.
+//       Both probes also returned 401 on v7 /finance/quote.
+// v23 – (pending) fall back to a second source when a quote is stale.
+// v22 – act on v21. Two changes.
 //
-//       ?symbols=SYM&diag=1 probes the same URLs the quote path uses and
-//       reports status, timing, Cloudflare's cf-cache-status and Yahoo's own
-//       Age/Date/X-Cache headers, alongside request.cf.colo. Read-only and
-//       opt-in; without diag=1 nothing behaves differently.
+//       1. The v7 batch branch is gone. It returns 401 "User is unable to
+//          access this feature" from every colo, so it could never succeed;
+//          each refresh spent one request finding that out before falling
+//          through to the chart fan-out. getQuoteRef() went with it — it
+//          existed only to repair the batch result, and the fan-out already
+//          derives prevClose the same way.
+//
+//       2. FMP is the obvious fallback candidate and env.FMP_API_KEY is
+//          already deployed, but DATA_SOURCES.md calls it free tier, 250
+//          req/day, "gap-fill only" for fundamentals. Nothing says it quotes
+//          Copenhagen listings, and .CO is most of this portfolio. So diag=1
+//          probes it — v3 and stable endpoints — and reports status, price,
+//          timestamp age and any plan error.
+//
+//       Measure, then wire it in. Not the other way round.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
@@ -90,7 +89,8 @@ import { companyNews } from './news.js';
 // How long a Cloudflare colo may reuse a Yahoo quote response.
 const QUOTE_CACHE_TTL = 60;
 
-// Minute-bucketed cache buster — see the v20 note.
+// Minute-bucketed cache buster. Kept as hygiene — it is correct, it just was
+// never the problem. See v21.
 const bust = () => `&_cb=${Math.floor(Date.now() / 60000)}`;
 
 export default {
@@ -217,21 +217,12 @@ export default {
 
     // ── Ticker snapshot: ?quote=SYMBOL ────────────────────────────────────────────────────
     // Everything the shared ticker page needs for a company that has no row in
-    // `portfolio`: currency, name, sector, market cap, P/E. Without this the
-    // page renders four dashes for every un-held symbol, which is exactly the
-    // case the merged page exists to serve.
+    // `portfolio`: currency, name, sector, market cap, P/E.
     //
-    // Two independent sources, deliberately:
-    //   price + chgPct  ← the chart series. quoteSummary's
-    //                     regularMarketChangePercent goes stale intraday; this
-    //                     is the same reconstruction ?symbols= already does.
-    //   fundamentals    ← yahooSummary(), which owns the crumb handshake and
-    //                     the 15-minute cache the screener already warms, so a
-    //                     ticker page costs nothing extra once it is hot.
-    //
-    // Either half can fail alone, so we only 404 when NEITHER answered. A dead
-    // quoteSummary still leaves a priced chart rather than a blank page, and
-    // `summary_ok: false` distinguishes "upstream broke" from "no such data".
+    // Two independent sources, deliberately: price + chgPct from the chart
+    // series, fundamentals from yahooSummary(). Either half can fail alone, so
+    // we only 404 when NEITHER answered, and `summary_ok: false` distinguishes
+    // "upstream broke" from "no such data".
     const quoteSym = url.searchParams.get('quote');
     if (quoteSym) {
       const refreshQuote = url.searchParams.get('refresh') === '1';
@@ -269,22 +260,9 @@ export default {
 
     // ── News endpoint ─────────────────────────────────────────────────────────────────────
     // Resolution, fan-out and relevance filtering live in news.js. The handler
-    // this replaced was a single URL:
-    //
-    //   /v1/finance/search?q=${newsSymbol}&newsCount=10
-    //
-    // `q` there is FREE TEXT, not a symbol lookup, and it was being handed the
-    // app's Yahoo LISTING symbol. Against production that returned, for
-    // ?news=NOVO-B.CO, ten articles about Tesla, Miami-Dade early voting and
-    // Tibetan antelopes — and nothing about Novo Nordisk. A total miss came
-    // back empty; a partial miss came back as Yahoo's general market firehose,
-    // which the panel then rendered as company news. Every non-US listing took
-    // this path: ASML.AS, CSU.TO, CHG.DE.
-    //
-    // &name= is the company name the page already has on screen. It is a hint,
-    // not a requirement — it saves a quoteSummary round-trip and keeps the
-    // fan-out working when quoteSummary is down, since the company name is the
-    // single most productive query of the set.
+    // this replaced passed the exchange-suffixed LISTING symbol to Yahoo's
+    // free-text search endpoint, which for NOVO-B.CO returned ten articles
+    // about Tesla, Miami-Dade early voting and Tibetan antelopes.
     //
     // &debug=1 reports what each source contributed and how much was dropped,
     // because "no news" and "everything was filtered out" look identical from
@@ -323,8 +301,7 @@ export default {
 
     // ── Chart endpoint ────────────────────────────────────────────────────────────────────
     // Historical series only — deliberately not cache-busted. A 1-year chart
-    // does not go stale the way a live quote does, and letting the colo hold it
-    // is the point.
+    // does not go stale the way a live quote does.
     const chart = url.searchParams.get('chart');
     if (chart) {
       const range = url.searchParams.get('range') || '3mo';
@@ -346,13 +323,8 @@ export default {
     }
 
     // ── Screener: score a ticker ───────────────────────────────────────────────────────────
-    // Scoring lives in screener_score.js. Quantitative criteria are computed
-    // from filings (EDGAR → Yahoo → FMP, per field); only the six qualitative
-    // criteria go to Gemini, search-grounded. Missing data scores null and is
+    // Scoring lives in screener_score.js. Missing data scores null and is
     // excluded from the denominator rather than defaulting to a passing 1.
-    //
-    // ?refresh=1 bypasses every cache layer. Keep it — a cached score would
-    // have hidden the XBRL stock-split bug instead of surfacing it.
     const scoreTickerSym = url.searchParams.get('score_ticker');
     if (scoreTickerSym) {
       const authHeader = request.headers.get('Authorization') || '';
@@ -363,13 +335,8 @@ export default {
       }
 
       // Verify the token BEFORE doing ~30s of work. `startsWith('Bearer ')` is
-      // not authentication — it accepts any string. auth.php rotates api_token
-      // on every login, so a token left in localStorage after signing in
-      // elsewhere is stale, and used to buy a full grounded-search score that
-      // could never be saved.
-      //
-      // Fails OPEN on a network error: a labanos.dk hiccup shouldn't block
-      // scoring, and the persist result below reports the truth regardless.
+      // not authentication — it accepts any string. Fails OPEN on a network
+      // error; the persist result below reports the truth regardless.
       try {
         const verify = await fetch('https://labanos.dk/auth.php', {
           headers: { 'Authorization': authHeader },
@@ -387,8 +354,8 @@ export default {
       try {
         const scoreResult = await scoreTicker(symbol, env, refresh);
 
-        // Persist. A 401/500 here is a RESOLVED fetch, not an exception, so the
-        // old `try { await fetch(...) } catch {}` never saw it and every failed
+        // A 401/500 here is a RESOLVED fetch, not an exception, so the old
+        // `try { await fetch(...) } catch {}` never saw it and every failed
         // save vanished silently. Check the status and report it.
         let persisted = false, persistStatus = null, persistError = null;
         try {
@@ -432,79 +399,89 @@ export default {
     // Probes the exact URLs the quote path uses and reports what came back,
     // because everything below this point throws that information away.
     //
-    // The five probes are chosen to separate causes that look identical from
-    // outside:
-    //   chart-plain / batch-plain     what the app actually gets today
-    //   chart-busted / batch-busted   does Yahoo accept the _cb parameter, and
-    //                                 does a fresh key change the answer?
-    //   chart-nocache                 cacheTtl 0, so Cloudflare must not serve
-    //                                 a stored copy — if this is STILL stale,
-    //                                 the stale copy is Yahoo's, not ours
+    // chart-plain / chart-busted   what the app actually gets
+    // chart-nocache                cacheTtl 0, so Cloudflare must not serve a
+    //                              stored copy — still stale here means the
+    //                              stale copy is Yahoo's, not ours (it is)
+    // fmp-v3 / fmp-stable          can the fallback candidate quote this
+    //                              symbol at all, on this plan?
     //
-    // cf-cache-status is Cloudflare's verdict on our subrequest; Age/X-Cache/
-    // Via are Yahoo's own CDN talking. `colo` makes the whole thing
-    // attributable to a place, which is the one variable that separates a
-    // working session from a broken one.
+    // The API key is never echoed: it goes in the URL because FMP requires it
+    // there, and nothing derived from that URL reaches the response body.
     if (url.searchParams.get('diag') === '1') {
       const sym       = symbols[0] || 'AAPL';
       const chartBase = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=5m&range=5d`;
-      const batchBase = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketTime`;
 
-      const probe = async (label, target, cfOpts) => {
+      const probe = async (label, target, opts) => {
         const t0 = Date.now();
         try {
-          const res  = await fetch(target, { headers: yfHeaders, cf: cfOpts });
+          const res  = await fetch(target, opts);
           const text = await res.text();
-          let price = null, quoteTime = null, parsed = false;
+          let price = null, quoteTime = null, parsed = false, note = null;
           try {
-            const j    = JSON.parse(text);
+            const j = JSON.parse(text);
             const meta = j?.chart?.result?.[0]?.meta;
-            const q    = j?.quoteResponse?.result?.[0];
-            price      = meta?.regularMarketPrice ?? q?.regularMarketPrice ?? null;
-            quoteTime  = meta?.regularMarketTime  ?? q?.regularMarketTime  ?? null;
-            parsed     = true;
-          } catch { /* not JSON — bodyHead below will show what it was */ }
+            if (meta) {
+              price     = meta.regularMarketPrice ?? null;
+              quoteTime = meta.regularMarketTime  ?? null;
+            }
+            // FMP v3 returns an array; FMP stable returns an array too, with
+            // the same field names. An object with `Error Message` is a plan
+            // or key problem and is the single most useful thing to surface.
+            const row = Array.isArray(j) ? j[0] : null;
+            if (row) {
+              price     = row.price ?? row.previousClose ?? null;
+              quoteTime = row.timestamp ?? null;
+            }
+            if (!Array.isArray(j) && (j?.['Error Message'] || j?.message)) {
+              note = String(j['Error Message'] || j.message).slice(0, 200);
+            }
+            parsed = true;
+          } catch { /* not JSON — bodyHead shows what it was */ }
           const h = {};
-          for (const k of ['cf-cache-status','age','date','expires','cache-control',
-                           'x-cache','x-cache-hits','via','server','x-served-by',
-                           'retry-after','x-yahoo-request-id','x-envoy-upstream-service-time']) {
+          for (const k of ['cf-cache-status','age','date','cache-control','x-cache',
+                           'via','server','retry-after','x-envoy-upstream-service-time']) {
             const v = res.headers.get(k);
             if (v) h[k] = v;
           }
           return {
-            label,
-            status: res.status,
-            ms: Date.now() - t0,
-            bytes: text.length,
-            parsed,
-            price,
-            quoteTime,
+            label, status: res.status, ms: Date.now() - t0, bytes: text.length,
+            parsed, price, quoteTime,
             ageMin: quoteTime ? Math.round((Date.now() / 1000 - quoteTime) / 60) : null,
-            headers: h,
-            bodyHead: (res.ok && parsed) ? undefined : text.slice(0, 400),
+            note, headers: h,
+            bodyHead: (res.ok && parsed && !note) ? undefined : text.slice(0, 300),
           };
         } catch (e) {
           return { label, error: String((e && e.message) || e), ms: Date.now() - t0 };
         }
       };
 
-      const cfCached = { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true };
-      const cfNone   = { cacheTtl: 0 };
+      const cfCached = { headers: yfHeaders, cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true } };
+      const cfNone   = { headers: yfHeaders, cf: { cacheTtl: 0 } };
 
       const probes = [];
-      // Sequential on purpose: parallel probes can share a single cache fill
-      // and hide exactly the difference we are trying to measure.
-      probes.push(await probe('chart-plain',   chartBase,                          cfCached));
-      probes.push(await probe('chart-busted',  chartBase + bust(),                 cfCached));
-      probes.push(await probe('chart-nocache', chartBase + `&_d=${Date.now()}`,    cfNone));
-      probes.push(await probe('batch-plain',   batchBase,                          cfCached));
-      probes.push(await probe('batch-busted',  batchBase + bust(),                 cfCached));
+      // Sequential on purpose: parallel probes can share one cache fill and
+      // hide the very difference being measured.
+      probes.push(await probe('chart-plain',   chartBase,                       cfCached));
+      probes.push(await probe('chart-busted',  chartBase + bust(),              cfCached));
+      probes.push(await probe('chart-nocache', chartBase + `&_d=${Date.now()}`, cfNone));
+
+      const fmpKey = env.FMP_API_KEY;
+      if (fmpKey) {
+        probes.push(await probe('fmp-v3',
+          `https://financialmodelingprep.com/api/v3/quote/${encodeURIComponent(sym)}?apikey=${fmpKey}`,
+          { cf: { cacheTtl: 0 } }));
+        probes.push(await probe('fmp-stable',
+          `https://financialmodelingprep.com/stable/quote?symbol=${encodeURIComponent(sym)}&apikey=${fmpKey}`,
+          { cf: { cacheTtl: 0 } }));
+      } else {
+        probes.push({ label: 'fmp', error: 'FMP_API_KEY not bound to this worker' });
+      }
 
       return new Response(JSON.stringify({
         symbol:    sym,
         colo:      request.cf?.colo ?? null,
         country:   request.cf?.country ?? null,
-        clientTZ:  request.cf?.timezone ?? null,
         workerNow: Math.floor(Date.now() / 1000),
         probes,
       }, null, 2), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
@@ -517,9 +494,8 @@ export default {
         .finally(() => clearTimeout(timer));
     };
 
-    // Cache-busted first, plain URL as the fallback. If Yahoo ever rejects the
-    // extra parameter this degrades to v18 behaviour — stale but present —
-    // rather than to an empty table.
+    // Cache-busted first, plain URL as the fallback, so a rejected parameter
+    // degrades to stale-but-present rather than to an empty table.
     const fetchYf = async (baseUrl, ms) => {
       const busted = await fetchWithTimeout(baseUrl + bust(), { headers: yfHeaders }, ms).catch(() => null);
       if (busted && busted.ok) return busted;
@@ -528,73 +504,10 @@ export default {
 
     const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
 
-    // Previous close AND the exchange's own timestamp for one symbol.
-    //
-    // This returns an object rather than a bare number because the batch path
-    // below needs both and only makes this call once. The timestamp is the
-    // point: the v7 batch hands back a price with no indication of when the
-    // exchange set it, and a client with no timestamp invents one.
-    const getQuoteRef = async (symbol) => {
-      try {
-        const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
-        const res   = await fetchYf(yfUrl, 6000);
-        if (!res) return null;
-        const data  = await res.json();
-        const result     = data?.chart?.result?.[0];
-        const meta       = result?.meta;
-        if (!meta) return null;
-        const timestamps = result?.timestamp ?? [];
-        const closes     = result?.indicators?.quote?.[0]?.close ?? [];
-        const today      = fmtDate.format(new Date());
-        const ref = {
-          prevClose: meta.chartPreviousClose ?? meta.previousClose ?? null,
-          quoteTime: meta.regularMarketTime ?? null,
-          timezone:  meta.exchangeTimezoneName ?? null,
-        };
-        // Walk back to the most recent close that is not today in Copenhagen.
-        // Unchanged behaviour — this is what keeps a US holding at 0.00% before
-        // the US open instead of reporting yesterday's move as today's.
-        for (let i = timestamps.length - 1; i >= 0; i--) {
-          if (closes[i] != null && fmtDate.format(new Date(timestamps[i] * 1000)) !== today) { ref.prevClose = closes[i]; break; }
-        }
-        return ref;
-      } catch { return null; }
-    };
-
-    try {
-      const safeSymbols = symbolsParam.replace(/=/g, '%3D');
-      const batchUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${safeSymbols}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketTime,exchangeTimezoneName`;
-      const batchRes = await fetchYf(batchUrl, 8000);
-      if (batchRes && batchRes.ok) {
-        const data = await batchRes.json();
-        const batchResults = data?.quoteResponse?.result || [];
-        if (batchResults.length > 0) {
-          const corrected = await Promise.all(batchResults.map(async q => {
-            const price = q.regularMarketPrice;
-            const ref = await getQuoteRef(q.symbol);
-            const prevClose = ref?.prevClose ?? null;
-            const changePercent = (prevClose && price != null)
-              ? ((price - prevClose) / prevClose) * 100
-              : (q.regularMarketChangePercent ?? 0);
-            return {
-              symbol: q.symbol,
-              regularMarketPrice: price,
-              regularMarketChangePercent: changePercent,
-              // Epoch SECONDS, the unit Yahoo uses in both sources. The batch
-              // field wins when present; the chart meta is the fallback. When
-              // neither answers this stays null and the client must render it
-              // as unknown rather than substituting the current time.
-              regularMarketTime: q.regularMarketTime ?? ref?.quoteTime ?? null,
-              exchangeTimezoneName: q.exchangeTimezoneName ?? ref?.timezone ?? null,
-            };
-          }));
-          return new Response(JSON.stringify({ quoteResponse: { result: corrected, error: null } }), {
-            headers: { 'Content-Type': 'application/json', ...corsHeaders },
-          });
-        }
-      }
-    } catch { /* fall through */ }
-
+    // One chart request per symbol. This used to be the fallback behind a v7
+    // batch call; since v22 it is the only path, because the batch endpoint
+    // returns 401 everywhere and correcting its output cost a second request
+    // per symbol anyway.
     const results = await Promise.all(symbols.map(async symbol => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
@@ -608,6 +521,9 @@ export default {
         const timestamps   = result?.timestamp ?? [];
         const closes       = result?.indicators?.quote?.[0]?.close ?? [];
         const today        = fmtDate.format(new Date());
+        // Walk back to the most recent close that is not today in Copenhagen.
+        // This is what keeps a US holding at 0.00% before the US open instead
+        // of reporting yesterday's move as today's.
         let prevClose = null;
         for (let i = timestamps.length - 1; i >= 0; i--) {
           if (closes[i] != null && fmtDate.format(new Date(timestamps[i] * 1000)) !== today) { prevClose = closes[i]; break; }
@@ -618,6 +534,8 @@ export default {
           symbol,
           regularMarketPrice: price,
           regularMarketChangePercent: changePercent,
+          // Epoch SECONDS. Null when Yahoo gave none — the client renders that
+          // as unknown and must never substitute the current time.
           regularMarketTime: meta.regularMarketTime ?? null,
           exchangeTimezoneName: meta.exchangeTimezoneName ?? null,
         };
