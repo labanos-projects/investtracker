@@ -60,40 +60,28 @@
 //
 //       Nothing about price or change% changed. prevClose is still the last
 //       candle that is not today in Copenhagen.
-// v19 – cap edge caching of Yahoo responses at 60 seconds.
+// v19 – cap edge caching of Yahoo responses at 60 seconds. A Worker's outbound
+//       fetch() is cached at the colo that ran it, honouring whatever cache
+//       headers the origin sent, and this file never set a TTL.
+// v20 – v19 did not work: cacheTtl applies when Cloudflare STORES a response,
+//       so entries already held kept their original lifetime. Added a
+//       minute-bucketed cache buster so each minute gets its own key.
 //
-//       A Worker's outbound fetch() is cached at the colo that ran it, keyed on
-//       the URL, honouring whatever cache headers the origin sent. This file
-//       never set a TTL, so a colo was free to hold a Yahoo response for hours.
+//       That did not work either, and the reason matters. Probing symbols the
+//       app had never requested — ORSTED.CO, VWS.CO, SAP.DE — returned data
+//       pinned to the same ~09:40 boundary as everything else, across three
+//       exchanges. A per-URL cache cannot do that. Whatever is serving this
+//       region is serving a frozen view of the entire dataset.
+// v21 – so stop guessing and look. Every upstream failure here is swallowed:
+//       `if (!res.ok) continue`, bare `catch {}`. A 429, Yahoo's 999 rate-limit
+//       code, a timeout and a parse error are all indistinguishable from the
+//       outside, which is exactly the information needed to explain why one
+//       region goes stale while another does not.
 //
-//       It did. Measured 6 August at 14:36 CEST, the same worker and the same
-//       URL, from two places at once:
-//
-//         non-EU colo    DANSKE.CO  379.30    1 minute old
-//         CPH colo       DANSKE.CO  379.00  298 minutes old
-//
-//       The Copenhagen colo had cached Yahoo's responses at about 09:40 and
-//       replayed that snapshot for the rest of the day. Every user of this app
-//       is in Denmark, so every user saw a portfolio frozen at breakfast, while
-//       every test from elsewhere reported a healthy live feed. The v18
-//       timestamps are what made it visible: the rows said 09.40 while the
-//       clock said 14.36.
-//
-//       Not a batch-size problem — ?quote= is one chart request on a separate
-//       path and was 298 minutes stale as well.
-// v20 – v19 did not work, and the reason is worth keeping. cacheTtl applies
-//       when Cloudflare STORES a response. The entries poisoned at 09:40 kept
-//       the lifetime they were stored with, so shortening the TTL for new
-//       writes evicted nothing: fifteen minutes after v19 deployed, Copenhagen
-//       still answered DANSKE.CO at 304 minutes old.
-//
-//       So vary the URL instead. A different cache key cannot hit a poisoned
-//       entry. Bucketed by the minute, which keeps the shielding (a burst still
-//       shares one upstream hit) while capping staleness at 60 seconds.
-//
-//       This also covers the possibility that the stale copy lived in Yahoo's
-//       CDN rather than Cloudflare's. From outside the two are indistinguisha-
-//       ble, and a changing URL defeats both.
+//       ?symbols=SYM&diag=1 probes the same URLs the quote path uses and
+//       reports status, timing, Cloudflare's cf-cache-status and Yahoo's own
+//       Age/Date/X-Cache headers, alongside request.cf.colo. Read-only and
+//       opt-in; without diag=1 nothing behaves differently.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
@@ -102,10 +90,7 @@ import { companyNews } from './news.js';
 // How long a Cloudflare colo may reuse a Yahoo quote response.
 const QUOTE_CACHE_TTL = 60;
 
-// Minute-bucketed cache buster. Appended to Yahoo quote URLs so each minute
-// gets its own cache key — see the v20 note for why a TTL alone was not enough.
-// Callers must fall back to the un-busted URL if Yahoo rejects the parameter:
-// stale prices are bad, absent prices are worse.
+// Minute-bucketed cache buster — see the v20 note.
 const bust = () => `&_cb=${Math.floor(Date.now() / 60000)}`;
 
 export default {
@@ -443,6 +428,88 @@ export default {
       'Referer': 'https://finance.yahoo.com/',
     };
 
+    // ── Diagnostics: ?symbols=SYM&diag=1 ──────────────────────────────────────────────────
+    // Probes the exact URLs the quote path uses and reports what came back,
+    // because everything below this point throws that information away.
+    //
+    // The five probes are chosen to separate causes that look identical from
+    // outside:
+    //   chart-plain / batch-plain     what the app actually gets today
+    //   chart-busted / batch-busted   does Yahoo accept the _cb parameter, and
+    //                                 does a fresh key change the answer?
+    //   chart-nocache                 cacheTtl 0, so Cloudflare must not serve
+    //                                 a stored copy — if this is STILL stale,
+    //                                 the stale copy is Yahoo's, not ours
+    //
+    // cf-cache-status is Cloudflare's verdict on our subrequest; Age/X-Cache/
+    // Via are Yahoo's own CDN talking. `colo` makes the whole thing
+    // attributable to a place, which is the one variable that separates a
+    // working session from a broken one.
+    if (url.searchParams.get('diag') === '1') {
+      const sym       = symbols[0] || 'AAPL';
+      const chartBase = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=5m&range=5d`;
+      const batchBase = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(sym)}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketTime`;
+
+      const probe = async (label, target, cfOpts) => {
+        const t0 = Date.now();
+        try {
+          const res  = await fetch(target, { headers: yfHeaders, cf: cfOpts });
+          const text = await res.text();
+          let price = null, quoteTime = null, parsed = false;
+          try {
+            const j    = JSON.parse(text);
+            const meta = j?.chart?.result?.[0]?.meta;
+            const q    = j?.quoteResponse?.result?.[0];
+            price      = meta?.regularMarketPrice ?? q?.regularMarketPrice ?? null;
+            quoteTime  = meta?.regularMarketTime  ?? q?.regularMarketTime  ?? null;
+            parsed     = true;
+          } catch { /* not JSON — bodyHead below will show what it was */ }
+          const h = {};
+          for (const k of ['cf-cache-status','age','date','expires','cache-control',
+                           'x-cache','x-cache-hits','via','server','x-served-by',
+                           'retry-after','x-yahoo-request-id','x-envoy-upstream-service-time']) {
+            const v = res.headers.get(k);
+            if (v) h[k] = v;
+          }
+          return {
+            label,
+            status: res.status,
+            ms: Date.now() - t0,
+            bytes: text.length,
+            parsed,
+            price,
+            quoteTime,
+            ageMin: quoteTime ? Math.round((Date.now() / 1000 - quoteTime) / 60) : null,
+            headers: h,
+            bodyHead: (res.ok && parsed) ? undefined : text.slice(0, 400),
+          };
+        } catch (e) {
+          return { label, error: String((e && e.message) || e), ms: Date.now() - t0 };
+        }
+      };
+
+      const cfCached = { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true };
+      const cfNone   = { cacheTtl: 0 };
+
+      const probes = [];
+      // Sequential on purpose: parallel probes can share a single cache fill
+      // and hide exactly the difference we are trying to measure.
+      probes.push(await probe('chart-plain',   chartBase,                          cfCached));
+      probes.push(await probe('chart-busted',  chartBase + bust(),                 cfCached));
+      probes.push(await probe('chart-nocache', chartBase + `&_d=${Date.now()}`,    cfNone));
+      probes.push(await probe('batch-plain',   batchBase,                          cfCached));
+      probes.push(await probe('batch-busted',  batchBase + bust(),                 cfCached));
+
+      return new Response(JSON.stringify({
+        symbol:    sym,
+        colo:      request.cf?.colo ?? null,
+        country:   request.cf?.country ?? null,
+        clientTZ:  request.cf?.timezone ?? null,
+        workerNow: Math.floor(Date.now() / 1000),
+        probes,
+      }, null, 2), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+    }
+
     const fetchWithTimeout = (url, opts, ms = 6000) => {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), ms);
@@ -571,10 +638,6 @@ export default {
 //
 // Returns chgPct as a FRACTION (0.0134), not a percentage. The frontend's pct()
 // multiplies by 100, which is why app.js divides the ?symbols= value by 100.
-//
-// Cache-busted like ?symbols=. This path was 298 minutes stale in Copenhagen
-// alongside the other one, which is how we know the problem was the edge cache
-// and not the batch endpoint.
 async function chartSnapshot(symbol) {
   const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
