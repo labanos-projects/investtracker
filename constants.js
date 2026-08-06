@@ -48,6 +48,33 @@ const pct = (v) => v==null||isNaN(v) ? '–' : (v>=0?'+':'−') + n(Math.abs(v*1
 const signed = (v, d=0) => v==null||isNaN(v) ? '–' : (v>=0?'+':'−') + n(Math.abs(v),d);
 const clr = (v) => Math.abs(v || 0) < 0.00005 ? 'text-gray-400' : v > 0 ? 'text-emerald-500' : 'text-red-500';
 
+// ─── Quote freshness ─────────────────────────────────────────────────────────────
+// Everything here is expressed in Copenhagen time, deliberately: "today" for
+// this app means today where the user is, which is the same definition the
+// worker uses when it decides which candle counts as the previous close.
+const CPH     = 'Europe/Copenhagen';
+const cphDay  = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: CPH }).format(d);
+const cphTime = (d) => d.toLocaleTimeString('da-DK', { hour: '2-digit', minute: '2-digit', timeZone: CPH });
+const cphDate = (d) => d.toLocaleDateString('da-DK', { day: '2-digit', month: '2-digit', timeZone: CPH });
+
+// A quote is "stale" when the exchange last priced it on an earlier day than
+// today in Copenhagen. For a US holding before 15:30 CET that is the normal,
+// correct state — the market simply has not opened — so the caller shows it as
+// information, not as an error.
+//
+// `unknown` is a third state and must not be collapsed into the other two: it
+// means the source returned no timestamp at all. Rendering that as the current
+// time is exactly the bug this replaces.
+const quoteStamp = (t) => {
+  if (!t) return { label: '–', stale: false, unknown: true };
+  const stale = cphDay(t) !== cphDay(new Date());
+  return {
+    label:   stale ? `${cphDate(t)} ${cphTime(t)}` : cphTime(t),
+    stale,
+    unknown: false,
+  };
+};
+
 // ─── computePosition ───────────────────────────────────────────────────────────────────
 // Derives shares held and average cost from a transaction array
 function computePosition(txns) {
