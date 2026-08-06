@@ -8,6 +8,9 @@
  * GOOGLEFINANCE quotes CPH, AMS, ETR and TSE natively, so a published sheet
  * becomes a keyless source for exactly the symbols that had no alternative.
  *
+ * Measured on the first live run: CPH and US report datadelay 0 (real time);
+ * AMS, ETR and TSE report 15 minutes.
+ *
  * Contract: returns the same envelope shape the Worker's ?symbols= endpoint
  * returns, so it can be consumed with almost no translation.
  *
@@ -60,6 +63,7 @@ function readQuotes() {
   var last = sh.getLastRow();
   if (last < 2) return [];
 
+  var tz   = ss.getSpreadsheetTimeZone();
   var rows = sh.getRange(2, 1, last - 1, 6).getValues();
   var out  = [];
 
@@ -78,7 +82,7 @@ function readQuotes() {
       // some thin listings). Null must render as unknown downstream; it must
       // never be replaced with the current time. That substitution is what
       // hid the 2026-08-06 outage for six hours.
-      regularMarketTime:  (r[4] instanceof Date) ? Math.floor(r[4].getTime() / 1000) : null,
+      regularMarketTime:  toEpochSeconds(r[4], tz),
       dataDelayMin:       toNum(r[5])
     });
   }
@@ -90,6 +94,40 @@ function toNum(v) {
   if (v === '' || v === null || v === undefined) return null;
   var n = Number(v);
   return isFinite(n) ? n : null;
+}
+
+/**
+ * A GOOGLEFINANCE("tradetime") cell arrives one of two ways.
+ *
+ * Formatted as Date time, getValues() hands back a real Date and there is
+ * nothing to do. Left unformatted, it arrives as a raw Sheets serial — days
+ * since 1899-12-30 — and the first live run returned null for all 31 symbols
+ * because the reader only accepted Date.
+ *
+ * Serials carry no timezone: they are wall clock in the SPREADSHEET's zone.
+ * Converting with a hardcoded offset would be an hour out for half the year,
+ * so ask for the actual offset at that instant instead.
+ */
+function toEpochSeconds(v, tz) {
+  if (v instanceof Date) return Math.floor(v.getTime() / 1000);
+
+  var serial = toNum(v);
+  if (serial === null || serial <= 0) return null;
+
+  // Interpret the serial as if it were UTC, then subtract the zone's offset at
+  // that moment to recover the true instant.
+  var naiveMs = Math.round((serial - 25569) * 86400 * 1000);
+  var offsetMinutes = zoneOffsetMinutes(new Date(naiveMs), tz);
+  return Math.round(naiveMs / 1000) - offsetMinutes * 60;
+}
+
+/** Offset in minutes east of UTC for `tz` at `date`, e.g. +120 for CEST. */
+function zoneOffsetMinutes(date, tz) {
+  var z = Utilities.formatDate(date, tz, 'Z');   // "+0200" / "-0500"
+  var sign = z.charAt(0) === '-' ? -1 : 1;
+  var hh = parseInt(z.substr(1, 2), 10);
+  var mm = parseInt(z.substr(3, 2), 10);
+  return sign * (hh * 60 + mm);
 }
 
 /**
@@ -116,7 +154,13 @@ function keepFresh() {
  */
 function testReadQuotes() {
   var rows = readQuotes();
-  Logger.log('rows: ' + rows.length);
+  var missingPrice = rows.filter(function (r) { return r.regularMarketPrice === null; });
+  var missingTime  = rows.filter(function (r) { return r.regularMarketTime === null; });
+
+  Logger.log('rows: ' + rows.length +
+             '  no price: ' + missingPrice.length +
+             '  no tradetime: ' + missingTime.length);
+
   rows.forEach(function (r) {
     Logger.log(
       r.symbol + '  ' + r.googleSymbol +
