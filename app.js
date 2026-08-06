@@ -5,7 +5,13 @@ function App() {
   const [loading, setLoading]         = useState(true);
   const [refreshing, setRefreshing]   = useState(false);
   const [isLive, setIsLive]           = useState(false);
+  // Two different facts, deliberately two different pieces of state:
+  //   lastUpdated — the OLDEST exchange quote time on screen (from the payload)
+  //   fetchedAt   — when we last asked (from this machine's clock)
+  // Collapsing them is the bug this replaces: `new Date()` was being shown
+  // under the label "Prices as of", which made every quote look current.
   const [lastUpdated, setLastUpdated] = useState(null);
+  const [fetchedAt, setFetchedAt]     = useState(null);
   const [sortBy, setSortBy]           = useState('value');
   const [sortDir, setSortDir]         = useState('desc');
   const [notice, setNotice]           = useState(null);
@@ -317,27 +323,38 @@ function App() {
       } catch (e) { continue; }
     }
 
+    setFetchedAt(new Date());
+
     if (rows) {
       const newPrices = {};
       const newFx = { ...CACHED_FX };
       rows.forEach(q => {
         const price  = q.regularMarketPrice;
         const chgPct = (q.regularMarketChangePercent ?? 0) / 100;
+        // Epoch SECONDS from the worker (v18+). Absent on older worker builds
+        // and on symbols Yahoo gave no time for — null is a valid answer here
+        // and renders as unknown, never as the current time.
+        const quoteTime = q.regularMarketTime ? new Date(q.regularMarketTime * 1000) : null;
+        const tz        = q.exchangeTimezoneName || null;
         if      (q.symbol === 'USDDKK=X') newFx.USD = price;
         else if (q.symbol === 'EURDKK=X') newFx.EUR = price;
         else if (q.symbol === 'CADDKK=X') newFx.CAD = price;
-        else newPrices[q.symbol] = { price, chgPct };
+        else newPrices[q.symbol] = { price, chgPct, quoteTime, tz };
       });
       setPrices(newPrices);
       setFx(newFx);
       setIsLive(true);
-      setLastUpdated(new Date());
+      // The OLDEST quote, not the newest: the header should report the worst
+      // case on screen. One holding stuck at Friday's close is the fact worth
+      // surfacing, and a max() would hide it behind whatever ticked last.
+      const stamps = Object.values(newPrices).map(p => p.quoteTime).filter(Boolean).map(d => d.getTime());
+      setLastUpdated(stamps.length ? new Date(Math.min(...stamps)) : null);
     } else {
       setIsLive(false);
       setLastUpdated(CACHED_AS_OF);
       if (Object.keys(prices).length === 0) {
         const cached = {};
-        pf.forEach(p => { cached[p.yhTicker] = { price: p.cachedPrice || 0, chgPct: p.cachedChg || 0 }; });
+        pf.forEach(p => { cached[p.yhTicker] = { price: p.cachedPrice || 0, chgPct: p.cachedChg || 0, quoteTime: null, tz: null }; });
         setPrices(cached);
         setFx(CACHED_FX);
       }
@@ -363,7 +380,7 @@ function App() {
     const glPct      = costBase > 0 ? glBase / costBase : 0;
     const prevPrice  = pd.chgPct !== -1 ? pd.price / (1 + pd.chgPct) : pd.price;
     const todayBase  = shares * (pd.price - prevPrice) * fxToBase;
-    return { ...p, shares, avgCost, price: pd.price, chgPct: pd.chgPct, fxToBase, costBase, valueBase, glBase, glPct, todayBase };
+    return { ...p, shares, avgCost, price: pd.price, chgPct: pd.chgPct, quoteTime: pd.quoteTime ?? null, tz: pd.tz ?? null, fxToBase, costBase, valueBase, glBase, glPct, todayBase };
   });
 
   const totalValue  = enriched.reduce((s,p) => s + p.valueBase, 0);
@@ -458,6 +475,18 @@ function App() {
     </th>
   );
 
+  // When the exchange last priced this row. Amber with a date means the quote
+  // predates today in Copenhagen — normal for a US holding before 15:30 CET,
+  // and the single most useful thing to know when the table looks frozen.
+  const QuoteTime = ({ t }) => {
+    const s = quoteStamp(t);
+    const tone = s.unknown ? 'text-gray-300' : s.stale ? 'text-amber-600' : 'text-gray-400';
+    const why  = s.unknown ? 'No quote time from the price source'
+               : s.stale   ? 'Exchange last priced this before today (CET) — market closed'
+               :             'Priced today (CET)';
+    return <div className={`text-[10px] mono ${tone}`} title={why}>{s.label}</div>;
+  };
+
   const priceStr = (p) => {
     const v = p.price;
     if (v == null) return '–';
@@ -470,6 +499,10 @@ function App() {
     if (view === 'watchlist') { requireLogin(() => setShowAddModal(true)); }
     else { setShowAddModal(true); }
   };
+
+  // Amber the header when anything on screen is from an earlier day, so the
+  // bar agrees with the rows instead of showing green over stale prices.
+  const anyStale = activePositions.some(p => quoteStamp(p.quoteTime).stale);
 
   return (
     <div className="min-h-screen bg-gray-50 pb-10">
@@ -606,20 +639,34 @@ function App() {
       {/* ── Portfolio view ── */}
       {view === 'portfolio' && (
         <>
-          {/* Price timestamp bar */}
-          {lastUpdated && (
-            <div className={`px-4 py-1.5 flex items-center justify-between text-[11px] border-b ${isLive ? 'bg-emerald-50 border-emerald-100 text-emerald-700' : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
+          {/* Quote-freshness bar. Two facts, kept apart: the oldest quote on
+              screen (from the payload) and when we last asked (our clock). */}
+          {(lastUpdated || fetchedAt) && (
+            <div className={`px-4 py-1.5 flex items-center justify-between text-[11px] border-b ${
+              isLive && !anyStale ? 'bg-emerald-50 border-emerald-100 text-emerald-700'
+                                  : 'bg-amber-50 border-amber-200 text-amber-700'}`}>
               <span>
-                {isLive ? '● Prices as of' : '⚠ Cached prices from'}{' '}
-                <span className="font-semibold mono">
-                  {lastUpdated.toLocaleTimeString('da-DK', {hour:'2-digit', minute:'2-digit', second:'2-digit'})}
-                </span>
-                {' '}
-                <span className="opacity-70">
-                  {lastUpdated.toLocaleDateString('da-DK', {day:'2-digit', month:'2-digit', year:'numeric'})}
-                </span>
+                {!isLive ? (
+                  <>
+                    ⚠ Cached prices from{' '}
+                    <span className="font-semibold mono">{lastUpdated ? cphTime(lastUpdated) : '–'}</span>
+                    {' '}
+                    <span className="opacity-70">{lastUpdated ? cphDate(lastUpdated) : ''}</span>
+                  </>
+                ) : lastUpdated ? (
+                  <>
+                    {anyStale ? '⚠ Oldest quote' : '● Oldest quote'}{' '}
+                    <span className="font-semibold mono">{cphTime(lastUpdated)}</span>
+                    {' '}
+                    <span className="opacity-70">{cphDate(lastUpdated)}</span>
+                  </>
+                ) : (
+                  <>⚠ Live prices — no quote times from source</>
+                )}
               </span>
-              {!isLive && <span className="font-medium">Live data unavailable</span>}
+              {isLive
+                ? <span className="opacity-70">checked <span className="mono">{fetchedAt ? cphTime(fetchedAt) : '–'}</span></span>
+                : <span className="font-medium">Live data unavailable</span>}
             </div>
           )}
 
@@ -714,6 +761,7 @@ function App() {
                         <td className="px-3 py-2.5 text-right">
                           <div className="font-medium text-gray-800 mono text-[13px]">{n(p.valueBase,0)}</div>
                           <div className="text-[11px] text-gray-400 mono">{priceStr(p)} <span className="text-[10px]">{p.ccy}</span></div>
+                          <QuoteTime t={p.quoteTime} />
                         </td>
                         <td className={`px-3 py-2.5 text-right mono ${clr(p.chgPct)}`}>
                           <div className="text-[13px] font-semibold">{pct(p.chgPct)}</div>
