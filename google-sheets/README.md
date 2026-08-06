@@ -21,23 +21,15 @@ endpoints that day:
 | Twelve Data | paid only |
 | **GOOGLEFINANCE** | **native — `CPH:`** |
 
-`GOOGLEFINANCE` also covers `AMS:`, `ETR:` and `TSE:`, which between them cover
-every non-US listing in the portfolio.
+Measured on the first live run: **CPH and US report `datadelay: 0`** — real
+time, not delayed. AMS, ETR and TSE report 15 minutes.
 
-Trade-offs, stated plainly: the data is **delayed** (typically 15–20 minutes on
-European exchanges), and Google's terms discourage redistributing it. For a
-personal tracker on your own domain that is a judgement call; for anything
-public it is not.
+Google's terms discourage redistributing this data. For a personal tracker on
+your own domain that is a judgement call; for anything public it is not.
 
 ## Setup
 
 **1. Create the sheet.** One tab named exactly `Quotes`.
-
-Set **File → Settings → Time zone** to `Europe/Copenhagen` *before* anything
-else. `GOOGLEFINANCE("tradetime")` is returned in the spreadsheet's timezone,
-and `Code.gs` converts it to epoch seconds assuming that setting is right. Get
-it wrong and every timestamp is silently offset by hours — which is exactly the
-class of bug this whole source exists to expose.
 
 **2. Headers in row 1:**
 
@@ -65,31 +57,67 @@ them (`NOVO-B.CO`, `AAPL`, `USDDKK=X`).
 Xetra is **`ETR:`**, not `DE:` — `CHG.DE` becomes `ETR:CHG`. US tickers pass
 through bare; Google resolves them without an exchange prefix.
 
-**5. Columns C–F**, filled down. `IFERROR` matters: currency pairs return no
-`closeyest` or `tradetime`, and a bare `#N/A` would break the whole read.
+**5. Columns C–F**, filled down.
+
+**Currency pairs take no attribute.** `GOOGLEFINANCE("CURRENCY:USDDKK","price")`
+returns `#N/A` — it must be called bare. Getting this wrong leaves every FX rate
+blank, which silently breaks base-currency conversion rather than erroring:
 
 ```
-C2  =IF($B2="","",IFERROR(GOOGLEFINANCE($B2,"price"),""))
+C2  =IF($B2="","",IF(LEFT($B2,9)="CURRENCY:",IFERROR(GOOGLEFINANCE($B2),""),IFERROR(GOOGLEFINANCE($B2,"price"),"")))
 D2  =IF($B2="","",IFERROR(GOOGLEFINANCE($B2,"closeyest"),""))
 E2  =IF($B2="","",IFERROR(GOOGLEFINANCE($B2,"tradetime"),""))
 F2  =IF($B2="","",IFERROR(GOOGLEFINANCE($B2,"datadelay"),""))
 ```
 
-**6. Apps Script.** Extensions → Apps Script, paste `Code.gs`, save. Run
-`testReadQuotes` once from the editor and read the log — symbol-mapping and
-coverage problems surface there as nulls, before anything depends on them.
+`IFERROR` matters elsewhere too: currency pairs return no `closeyest` or
+`tradetime`, and a bare `#N/A` breaks the whole read.
 
-**7. Deploy.** Deploy → New deployment → **Web app**:
+**6. Format column E as a date.** Select column E → **Format → Number → Date
+time**. Apps Script then returns real `Date` objects instead of raw serials.
+`Code.gs` handles both, but this path is cleaner.
 
-- Execute as: **Me**
-- Who has access: **Anyone**
+**7. Apps Script.** Extensions → Apps Script, paste `Code.gs`, save. Run
+`testReadQuotes` and read the log — it prints each quote's **age in minutes**,
+which is the number to eyeball. A timezone mistake shows up as a plausible
+few-hundred-minute age, not as an error.
 
-Copy the `/exec` URL. The Worker calls it server-side, so the redirect to
-`googleusercontent.com` that trips up browser CORS is irrelevant here.
+**8. Deploy.** Deploy → New deployment → **Web app**, Execute as **Me**, access
+**Anyone**. Copy the `/exec` URL. The Worker calls it server-side, so the
+redirect to `googleusercontent.com` that trips up browser CORS is irrelevant.
 
-**8. Trigger.** Triggers → Add trigger → `keepFresh` → Time-driven → Minutes
-timer → every 5 minutes. `GOOGLEFINANCE` is volatile and Google refreshes it
-server-side, but a sheet nobody has open can drift; this forces recalculation.
+Editing the script does **not** update the live web app. Redeploy via
+**Deploy → Manage deployments → ✏️ → Version: New version → Deploy.**
+
+**9. Trigger.** Triggers → Add trigger → `keepFresh` → Time-driven → Minutes
+timer → every 5 minutes. Stops a sheet nobody has open from drifting.
+
+## `tradetime` is in the EXCHANGE's local time
+
+The single most dangerous thing here, and invisible unless two exchanges are
+compared side by side. At 17:37 CEST the sheet showed:
+
+```
+CPH:NOVO-B   17:0x       ← Copenhagen local
+AAPL         11:2x       ← New York local
+TSE:CSU      10:4x       ← Toronto local
+```
+
+Same instant, three different wall clocks. A `Date` from `getValues()` is that
+wall clock interpreted in the **spreadsheet's** zone, which is correct for at
+most one exchange. Read literally it made US quotes appear ~6 hours old while
+they were actively trading:
+
+| symbol | naive reading | truth |
+|---|---|---|
+| AAPL | 435 min old | trading now |
+| CSU.TO | 451 min old | ~15 min |
+| NOVO-B.CO | 98 min old | ~37 min |
+
+`Code.gs` recovers the wall clock in the spreadsheet's zone and re-interprets it
+in the exchange's, keyed off the `CPH:`/`AMS:`/`ETR:`/`TSE:` prefix, resolving
+DST at that instant rather than assuming a fixed offset — Europe and the US
+switch on different dates, so a constant is wrong twice a year.
 
 ## Contract
 
@@ -98,8 +126,9 @@ Returns the same envelope as the Worker's `?symbols=`:
 ```json
 { "quoteResponse": { "result": [
     { "symbol": "NOVO-B.CO", "googleSymbol": "CPH:NOVO-B",
-      "regularMarketPrice": 295.55, "previousClose": 294.30,
-      "regularMarketTime": 1786002033, "dataDelayMin": 15 }
+      "regularMarketPrice": 293.60, "previousClose": 294.30,
+      "regularMarketTime": 1786001400, "exchangeTimeZone": "Europe/Copenhagen",
+      "dataDelayMin": 0 }
   ], "error": null } }
 ```
 
@@ -109,6 +138,7 @@ move — and showing that as "today" is the precise bug the Worker's Copenhagen
 walk-back prevents. The Worker takes raw inputs and applies its own rule: if
 `regularMarketTime` is not today in Copenhagen, today's change is 0.00%.
 
-`regularMarketTime` is null when Google gave no trade time. Null renders as
-unknown. It must never be replaced with the current time — that substitution is
-what hid the Yahoo outage for six hours.
+`regularMarketTime` is null when Google gave no trade time — currency pairs
+always, and some thin listings. Null renders as unknown. It must never be
+replaced with the current time; that substitution is what hid the Yahoo outage
+for six hours.
