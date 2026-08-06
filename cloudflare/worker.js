@@ -81,17 +81,32 @@
 //
 //       Not a batch-size problem — ?quote= is one chart request on a separate
 //       path and was 298 minutes stale as well.
+// v20 – v19 did not work, and the reason is worth keeping. cacheTtl applies
+//       when Cloudflare STORES a response. The entries poisoned at 09:40 kept
+//       the lifetime they were stored with, so shortening the TTL for new
+//       writes evicted nothing: fifteen minutes after v19 deployed, Copenhagen
+//       still answered DANSKE.CO at 304 minutes old.
+//
+//       So vary the URL instead. A different cache key cannot hit a poisoned
+//       entry. Bucketed by the minute, which keeps the shielding (a burst still
+//       shares one upstream hit) while capping staleness at 60 seconds.
+//
+//       This also covers the possibility that the stale copy lived in Yahoo's
+//       CDN rather than Cloudflare's. From outside the two are indistinguisha-
+//       ble, and a changing URL defeats both.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
 import { companyNews } from './news.js';
 
-// How long a Cloudflare colo may reuse a Yahoo quote response. Sixty seconds
-// keeps the app honest (it refreshes every five minutes) while still absorbing
-// bursts. Raising this re-introduces the v19 bug in slower motion; the failure
-// mode is invisible without the v18 timestamps, so check those before touching
-// this number.
+// How long a Cloudflare colo may reuse a Yahoo quote response.
 const QUOTE_CACHE_TTL = 60;
+
+// Minute-bucketed cache buster. Appended to Yahoo quote URLs so each minute
+// gets its own cache key — see the v20 note for why a TTL alone was not enough.
+// Callers must fall back to the un-busted URL if Yahoo rejects the parameter:
+// stale prices are bad, absent prices are worse.
+const bust = () => `&_cb=${Math.floor(Date.now() / 60000)}`;
 
 export default {
   async fetch(request, env) {
@@ -322,7 +337,7 @@ export default {
     }
 
     // ── Chart endpoint ────────────────────────────────────────────────────────────────────
-    // Historical series only — no TTL override here on purpose. A 1-year chart
+    // Historical series only — deliberately not cache-busted. A 1-year chart
     // does not go stale the way a live quote does, and letting the colo hold it
     // is the point.
     const chart = url.searchParams.get('chart');
@@ -428,15 +443,20 @@ export default {
       'Referer': 'https://finance.yahoo.com/',
     };
 
-    // `cf.cacheTtl` overrides the origin's cache headers for this subrequest.
-    // Without it the colo honours whatever Yahoo sent and can serve a quote for
-    // hours — see the v19 note. This is the only thing standing between a live
-    // price and a five-hour-old one.
     const fetchWithTimeout = (url, opts, ms = 6000) => {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), ms);
       return fetch(url, { ...opts, cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true }, signal: ctrl.signal })
         .finally(() => clearTimeout(timer));
+    };
+
+    // Cache-busted first, plain URL as the fallback. If Yahoo ever rejects the
+    // extra parameter this degrades to v18 behaviour — stale but present —
+    // rather than to an empty table.
+    const fetchYf = async (baseUrl, ms) => {
+      const busted = await fetchWithTimeout(baseUrl + bust(), { headers: yfHeaders }, ms).catch(() => null);
+      if (busted && busted.ok) return busted;
+      return await fetchWithTimeout(baseUrl, { headers: yfHeaders }, ms).catch(() => null);
     };
 
     const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
@@ -450,7 +470,8 @@ export default {
     const getQuoteRef = async (symbol) => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
-        const res   = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
+        const res   = await fetchYf(yfUrl, 6000);
+        if (!res) return null;
         const data  = await res.json();
         const result     = data?.chart?.result?.[0];
         const meta       = result?.meta;
@@ -476,8 +497,8 @@ export default {
     try {
       const safeSymbols = symbolsParam.replace(/=/g, '%3D');
       const batchUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${safeSymbols}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketTime,exchangeTimezoneName`;
-      const batchRes = await fetchWithTimeout(batchUrl, { headers: yfHeaders }, 8000);
-      if (batchRes.ok) {
+      const batchRes = await fetchYf(batchUrl, 8000);
+      if (batchRes && batchRes.ok) {
         const data = await batchRes.json();
         const batchResults = data?.quoteResponse?.result || [];
         if (batchResults.length > 0) {
@@ -510,7 +531,8 @@ export default {
     const results = await Promise.all(symbols.map(async symbol => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
-        const res  = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
+        const res  = await fetchYf(yfUrl, 6000);
+        if (!res) return null;
         const data = await res.json();
         const result     = data?.chart?.result?.[0];
         const meta       = result?.meta;
@@ -550,24 +572,23 @@ export default {
 // Returns chgPct as a FRACTION (0.0134), not a percentage. The frontend's pct()
 // multiplies by 100, which is why app.js divides the ?symbols= value by 100.
 //
-// Same cacheTtl as ?symbols=. This path was 298 minutes stale in Copenhagen
-// alongside the other one, which is how we know the problem was the colo cache
+// Cache-busted like ?symbols=. This path was 298 minutes stale in Copenhagen
+// alongside the other one, which is how we know the problem was the edge cache
 // and not the batch endpoint.
 async function chartSnapshot(symbol) {
   const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Referer': 'https://finance.yahoo.com/',
+  };
+  const opts = { headers, cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true }, signal: ctrl.signal };
   try {
     const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
-    const res   = await fetch(yfUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://finance.yahoo.com/',
-      },
-      cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true },
-      signal: ctrl.signal,
-    });
-    if (!res.ok) return null;
+    let res = await fetch(yfUrl + bust(), opts).catch(() => null);
+    if (!res || !res.ok) res = await fetch(yfUrl, opts).catch(() => null);
+    if (!res || !res.ok) return null;
     const data   = await res.json();
     const result = data?.chart?.result?.[0];
     const meta   = result?.meta;
