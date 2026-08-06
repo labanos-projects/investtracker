@@ -60,10 +60,38 @@
 //
 //       Nothing about price or change% changed. prevClose is still the last
 //       candle that is not today in Copenhagen.
+// v19 – cap edge caching of Yahoo responses at 60 seconds.
+//
+//       A Worker's outbound fetch() is cached at the colo that ran it, keyed on
+//       the URL, honouring whatever cache headers the origin sent. This file
+//       never set a TTL, so a colo was free to hold a Yahoo response for hours.
+//
+//       It did. Measured 6 August at 14:36 CEST, the same worker and the same
+//       URL, from two places at once:
+//
+//         non-EU colo    DANSKE.CO  379.30    1 minute old
+//         CPH colo       DANSKE.CO  379.00  298 minutes old
+//
+//       The Copenhagen colo had cached Yahoo's responses at about 09:40 and
+//       replayed that snapshot for the rest of the day. Every user of this app
+//       is in Denmark, so every user saw a portfolio frozen at breakfast, while
+//       every test from elsewhere reported a healthy live feed. The v18
+//       timestamps are what made it visible: the rows said 09.40 while the
+//       clock said 14.36.
+//
+//       Not a batch-size problem — ?quote= is one chart request on a separate
+//       path and was 298 minutes stale as well.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
 import { companyNews } from './news.js';
+
+// How long a Cloudflare colo may reuse a Yahoo quote response. Sixty seconds
+// keeps the app honest (it refreshes every five minutes) while still absorbing
+// bursts. Raising this re-introduces the v19 bug in slower motion; the failure
+// mode is invisible without the v18 timestamps, so check those before touching
+// this number.
+const QUOTE_CACHE_TTL = 60;
 
 export default {
   async fetch(request, env) {
@@ -294,6 +322,9 @@ export default {
     }
 
     // ── Chart endpoint ────────────────────────────────────────────────────────────────────
+    // Historical series only — no TTL override here on purpose. A 1-year chart
+    // does not go stale the way a live quote does, and letting the colo hold it
+    // is the point.
     const chart = url.searchParams.get('chart');
     if (chart) {
       const range = url.searchParams.get('range') || '3mo';
@@ -397,10 +428,15 @@ export default {
       'Referer': 'https://finance.yahoo.com/',
     };
 
+    // `cf.cacheTtl` overrides the origin's cache headers for this subrequest.
+    // Without it the colo honours whatever Yahoo sent and can serve a quote for
+    // hours — see the v19 note. This is the only thing standing between a live
+    // price and a five-hour-old one.
     const fetchWithTimeout = (url, opts, ms = 6000) => {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), ms);
-      return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+      return fetch(url, { ...opts, cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true }, signal: ctrl.signal })
+        .finally(() => clearTimeout(timer));
     };
 
     const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
@@ -513,6 +549,10 @@ export default {
 //
 // Returns chgPct as a FRACTION (0.0134), not a percentage. The frontend's pct()
 // multiplies by 100, which is why app.js divides the ?symbols= value by 100.
+//
+// Same cacheTtl as ?symbols=. This path was 298 minutes stale in Copenhagen
+// alongside the other one, which is how we know the problem was the colo cache
+// and not the batch endpoint.
 async function chartSnapshot(symbol) {
   const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -524,6 +564,7 @@ async function chartSnapshot(symbol) {
         'Accept': 'application/json, text/plain, */*',
         'Referer': 'https://finance.yahoo.com/',
       },
+      cf: { cacheTtl: QUOTE_CACHE_TTL, cacheEverything: true },
       signal: ctrl.signal,
     });
     if (!res.ok) return null;
