@@ -44,6 +44,22 @@
 //       news.js now resolves the listing to a company identity (name, sibling
 //       listings, sector, peers), fans out across several queries, and drops
 //       every article that matches neither the company nor its sector.
+// v18 – ?symbols= now returns WHEN each price is from. It returned price and
+//       change% and nothing else, so the client had no timestamp to show and
+//       used `new Date()` — the moment the fetch resolved — under the label
+//       "Prices as of". Every quote therefore looked current, including the
+//       twenty US holdings that do not trade at all before 15:30 CET and sit
+//       frozen at yesterday's close all morning. "Stuck prices" and "working
+//       correctly, market shut" were indistinguishable from the UI.
+//
+//       regularMarketTime was already present in the chart `meta` both paths
+//       parse; it was simply discarded. It is now passed through, with
+//       exchangeTimezoneName so the client can name the market. A symbol whose
+//       timestamp is missing returns null and must render as unknown — never
+//       as now.
+//
+//       Nothing about price or change% changed. prevClose is still the last
+//       candle that is not today in Copenhagen.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
@@ -208,6 +224,8 @@ export default {
         symbol:       quoteSym,
         price:        series?.price ?? summary?.price ?? null,
         chgPct:       series?.chgPct ?? null,
+        quoteTime:    series?.quoteTime ?? null,
+        timezone:     series?.timezone ?? null,
         currency:     summary?.currency ?? series?.currency ?? null,
         company:      summary?.longName ?? null,
         sector:       summary?.sector ?? null,
@@ -386,7 +404,14 @@ export default {
     };
 
     const fmtDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Copenhagen' });
-    const getRobustPrevClose = async (symbol) => {
+
+    // Previous close AND the exchange's own timestamp for one symbol.
+    //
+    // This returns an object rather than a bare number because the batch path
+    // below needs both and only makes this call once. The timestamp is the
+    // point: the v7 batch hands back a price with no indication of when the
+    // exchange set it, and a client with no timestamp invents one.
+    const getQuoteRef = async (symbol) => {
       try {
         const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=5d`;
         const res   = await fetchWithTimeout(yfUrl, { headers: yfHeaders }, 6000);
@@ -397,16 +422,24 @@ export default {
         const timestamps = result?.timestamp ?? [];
         const closes     = result?.indicators?.quote?.[0]?.close ?? [];
         const today      = fmtDate.format(new Date());
+        const ref = {
+          prevClose: meta.chartPreviousClose ?? meta.previousClose ?? null,
+          quoteTime: meta.regularMarketTime ?? null,
+          timezone:  meta.exchangeTimezoneName ?? null,
+        };
+        // Walk back to the most recent close that is not today in Copenhagen.
+        // Unchanged behaviour — this is what keeps a US holding at 0.00% before
+        // the US open instead of reporting yesterday's move as today's.
         for (let i = timestamps.length - 1; i >= 0; i--) {
-          if (closes[i] != null && fmtDate.format(new Date(timestamps[i] * 1000)) !== today) return closes[i];
+          if (closes[i] != null && fmtDate.format(new Date(timestamps[i] * 1000)) !== today) { ref.prevClose = closes[i]; break; }
         }
-        return meta.chartPreviousClose ?? meta.previousClose ?? null;
+        return ref;
       } catch { return null; }
     };
 
     try {
       const safeSymbols = symbolsParam.replace(/=/g, '%3D');
-      const batchUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${safeSymbols}&fields=regularMarketPrice,regularMarketChangePercent`;
+      const batchUrl = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${safeSymbols}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketTime,exchangeTimezoneName`;
       const batchRes = await fetchWithTimeout(batchUrl, { headers: yfHeaders }, 8000);
       if (batchRes.ok) {
         const data = await batchRes.json();
@@ -414,11 +447,22 @@ export default {
         if (batchResults.length > 0) {
           const corrected = await Promise.all(batchResults.map(async q => {
             const price = q.regularMarketPrice;
-            const prevClose = await getRobustPrevClose(q.symbol);
+            const ref = await getQuoteRef(q.symbol);
+            const prevClose = ref?.prevClose ?? null;
             const changePercent = (prevClose && price != null)
               ? ((price - prevClose) / prevClose) * 100
               : (q.regularMarketChangePercent ?? 0);
-            return { symbol: q.symbol, regularMarketPrice: price, regularMarketChangePercent: changePercent };
+            return {
+              symbol: q.symbol,
+              regularMarketPrice: price,
+              regularMarketChangePercent: changePercent,
+              // Epoch SECONDS, the unit Yahoo uses in both sources. The batch
+              // field wins when present; the chart meta is the fallback. When
+              // neither answers this stays null and the client must render it
+              // as unknown rather than substituting the current time.
+              regularMarketTime: q.regularMarketTime ?? ref?.quoteTime ?? null,
+              exchangeTimezoneName: q.exchangeTimezoneName ?? ref?.timezone ?? null,
+            };
           }));
           return new Response(JSON.stringify({ quoteResponse: { result: corrected, error: null } }), {
             headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -445,7 +489,13 @@ export default {
         }
         prevClose = prevClose ?? meta.chartPreviousClose ?? meta.previousClose ?? null;
         const changePercent = (prevClose && price != null) ? ((price - prevClose) / prevClose) * 100 : 0;
-        return { symbol, regularMarketPrice: price, regularMarketChangePercent: changePercent };
+        return {
+          symbol,
+          regularMarketPrice: price,
+          regularMarketChangePercent: changePercent,
+          regularMarketTime: meta.regularMarketTime ?? null,
+          exchangeTimezoneName: meta.exchangeTimezoneName ?? null,
+        };
       } catch { return null; }
     }));
 
@@ -501,8 +551,10 @@ async function chartSnapshot(symbol) {
 
     return {
       price,
-      chgPct:   (prevClose && price != null) ? (price - prevClose) / prevClose : null,
-      currency: meta.currency ?? null,
+      chgPct:    (prevClose && price != null) ? (price - prevClose) / prevClose : null,
+      currency:  meta.currency ?? null,
+      quoteTime: meta.regularMarketTime ?? null,
+      timezone:  meta.exchangeTimezoneName ?? null,
     };
   } catch {
     return null;
