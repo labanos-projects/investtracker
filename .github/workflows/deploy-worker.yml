@@ -24,6 +24,8 @@ jobs:
           secrets: |
             GEMINI_API_KEY
             FMP_API_KEY
+            GSHEET_URL
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+          GSHEET_URL: ${{ secrets.GSHEET_URL }}
