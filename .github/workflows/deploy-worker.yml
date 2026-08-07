@@ -9,6 +9,19 @@ on:
       # landed on master and never shipped.
       - 'cloudflare/**'
 
+# Only one deploy at a time, and the newest commit wins.
+#
+# Without this, run #61 sat Queued for seventeen hours during a GitHub runner
+# backlog and could not be cleared: the UI returns "Failed to cancel workflow"
+# and the API only allows deleting runs that have already completed. The next
+# push now supersedes a stuck run instead of joining it in the queue.
+#
+# cancel-in-progress is correct for a deploy specifically: if two commits land
+# together, letting the older one finish would put a superseded worker live.
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
