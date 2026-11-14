@@ -25,7 +25,9 @@
 //
 //  3. CIK resolution falls back to company-name matching. "NOVO-B.CO" reduces
 //     to "NOVO" but Novo Nordisk's ADR is "NVO", so the ticker-root lookup
-//     missed it and the whole 20-F/IFRS path went unused.
+//     missed it and the whole 20-F/IFRS path went unused. The ticker-ROOT
+//     match now requires the SEC name to agree: "ZEAL.CO" (Zealand Pharma)
+//     rooted to a US filer called ZEAL and would have taken its filings.
 //
 //  4. Every upstream goes through screener_cache.js. ?refresh=1 bypasses it.
 //
@@ -37,7 +39,16 @@
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
 
-const UA = 'InvestTracker/1.0 (labanos@gmail.com)';
+// SEC requires a descriptive User-Agent with a contact address — a condition
+// of use. The address lives in the SEC_CONTACT Worker secret, not in source:
+// it reaches here through `env`, via setSecContact() at the top of
+// resolveMetrics / resolveValuationInputs. Without it the UA is still
+// descriptive, but SEC may refuse — diagnostics.sec_contact says which.
+let _secContact = null;
+export function setSecContact(v) { if (v) _secContact = String(v).trim(); }
+export const secContactSet = () => !!_secContact;
+export const secUserAgent = () => _secContact ? `InvestTracker/1.0 (${_secContact})` : 'InvestTracker/1.0';
+
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const timeout = (p, ms) => Promise.race([p, new Promise((_, r) => setTimeout(() => r(new Error('timeout')), ms))]);
@@ -127,6 +138,7 @@ export async function yahooSummary(symbol, refresh = false) {
   return {
     currency: r.price?.currency || r.summaryDetail?.currency || 'USD',
     longName: r.price?.longName || r.price?.shortName || null,
+    exchange: r.price?.exchangeName || r.price?.exchange || null,
     sector: r.assetProfile?.sector || null,
     industry: r.assetProfile?.industry || null,
     price: raw(r.price?.regularMarketPrice),
@@ -177,21 +189,40 @@ export async function yahooTimeseries(symbol, refresh = false) {
 }
 
 // ─── SEC EDGAR ───────────────────────────────────────────────────────────────
-let _tickerMap = null, _nameMap = null;
+let _tickerMap = null, _nameMap = null, _cikName = null;
+
+const LEGAL_SUFFIX = /\b(INC|CORP|CORPORATION|COMPANY|CO|LTD|PLC|A\/S|AB|NV|SA|SE|AG|HOLDINGS?|GROUP|THE)\b/g;
 
 const normName = s => String(s || '').toUpperCase()
-  .replace(/\b(INC|CORP|CORPORATION|COMPANY|CO|LTD|PLC|A\/S|AB|NV|SA|SE|AG|HOLDINGS?|GROUP|THE)\b/g, '')
+  .replace(LEGAL_SUFFIX, '')
   .replace(/[^A-Z0-9]/g, '');
+
+/**
+ * Do two company names plausibly denote the same company?
+ *
+ * Compares the first significant WORD, not a prefix of the squashed name:
+ * "ZEAL Network SE" and "Zealand Pharma A/S" share the prefix ZEAL but their
+ * first words are ZEAL and ZEALAND — and that collision is exactly the
+ * ZEAL.CO bug. Unknown on either side returns null, never true.
+ */
+export function sameCompany(a, b) {
+  const first = s => String(s || '').toUpperCase().replace(LEGAL_SUFFIX, ' ')
+    .split(/[^A-Z0-9]+/).filter(Boolean)[0] || null;
+  const fa = first(a), fb = first(b);
+  if (!fa || !fb) return null;
+  return fa === fb;
+}
 
 async function loadSecMaps(refresh = false) {
   if (_tickerMap && !refresh) return;
   const d = await cachedJson('https://www.sec.gov/files/company_tickers_exchange.json',
-    { headers: { 'User-Agent': UA } },
+    { headers: { 'User-Agent': secUserAgent() } },
     { ttl: TTL.SEC_MAP, ms: 12000, refresh, key: 'sec:ticker-map' });
   const iT = d.fields.indexOf('ticker'), iC = d.fields.indexOf('cik'), iN = d.fields.indexOf('name');
-  _tickerMap = {}; _nameMap = {};
+  _tickerMap = {}; _nameMap = {}; _cikName = {};
   for (const row of d.data) {
     _tickerMap[String(row[iT]).toUpperCase()] = row[iC];
+    if (!_cikName[row[iC]]) _cikName[row[iC]] = row[iN];
     const n = normName(row[iN]);
     if (n && !_nameMap[n]) _nameMap[n] = row[iC];
   }
@@ -203,13 +234,21 @@ async function loadSecMaps(refresh = false) {
  * The name fallback is what makes European 20-F filers reachable: "NOVO-B.CO"
  * roots to "NOVO", but Novo Nordisk lists in the US as "NVO". Matching on
  * "NOVONORDISK" finds CIK 353278 and unlocks the IFRS branch.
+ *
+ * The ticker-ROOT match is only trusted when the SEC entity's name agrees with
+ * the company name. A root is not an identity: "ZEAL.CO" (Zealand Pharma)
+ * roots to "ZEAL", which is a different US filer entirely (CIK 2068427). EDGAR
+ * outranks Yahoo in every waterfall, so an unchecked root match would replace
+ * correct Yahoo figures with another company's audited ones — confidently.
  */
 export async function secCik(symbol, companyName, refresh = false) {
   await loadSecMaps(refresh);
   const up = symbol.toUpperCase();
   if (_tickerMap[up]) return _tickerMap[up];
   const root = up.replace(/[-.].*$/, '');
-  if (_tickerMap[root]) return _tickerMap[root];
+  if (_tickerMap[root] && sameCompany(_cikName[_tickerMap[root]], companyName) === true) {
+    return _tickerMap[root];
+  }
   if (companyName) {
     const n = normName(companyName);
     if (n && _nameMap[n]) return _nameMap[n];
@@ -277,7 +316,7 @@ export async function edgarFacts(cik, refresh = false) {
   const padded = String(cik).padStart(10, '0');
   // The slowest call in the chain — multi-MB, and changes four times a year.
   const d = await cachedJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,
-    { headers: { 'User-Agent': UA } },
+    { headers: { 'User-Agent': secUserAgent() } },
     { ttl: TTL.EDGAR, ms: 15000, refresh, key: `edgar:${padded}` });
 
   /**
@@ -341,6 +380,7 @@ export async function edgarFacts(cik, refresh = false) {
 // ─── Merge into a metrics bag with provenance ────────────────────────────────
 
 export async function resolveMetrics(symbol, env, refresh = false) {
+  setSecContact(env?.SEC_CONTACT);
   const m = {};
   const set = (k, v, source) => {
     if (v === null || v === undefined || (typeof v === 'number' && !isFinite(v))) return;
@@ -487,13 +527,19 @@ export async function resolveMetrics(symbol, env, refresh = false) {
       const fx = await fxToUsd(summary.currency, refresh);
       if (fx) set('mktcap_usd', summary.mktcap_native * fx, `yahoo+fx(${summary.currency})`);
     }
-    m._meta = { currency: summary.currency, sector: summary.sector, industry: summary.industry, price: summary.price };
+    m._meta = {
+      currency: summary.currency, sector: summary.sector, industry: summary.industry, price: summary.price,
+      longName: summary.longName, exchange: summary.exchange,
+    };
   }
 
   // ── FMP last: free tier, partial endpoint coverage, so gap-fill only ──
   if (env?.FMP_API_KEY && !m.roic) {
     try {
-      const fmpSym = symbol.replace(/\.[A-Z]{1,3}$/, '');
+      // The full symbol, suffix included. Stripping ".CO" turned ZEAL.CO into
+      // ZEAL — a different, US-listed company. FMP uses the same exchange
+      // suffixes as Yahoo; an unknown symbol returns nothing, which is honest.
+      const fmpSym = symbol;
       // Cached hardest of all — this is the only metered upstream (250/day),
       // and the api key must stay out of the cache key.
       const km = await cachedJson(
@@ -510,6 +556,7 @@ export async function resolveMetrics(symbol, env, refresh = false) {
   m._diag = {
     edgar_cik: cik || null,
     edgar_ok: !!edgar,
+    sec_contact: secContactSet(),
     yahoo_ok: ok,
     yahoo_err: summary?._err || null,
     ts_ok: !!ts,

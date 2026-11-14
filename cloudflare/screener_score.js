@@ -6,7 +6,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { RUBRIC, computeQuantCriteria, aggregate, redFlags, sustainableGrowth, yearsToMultiple } from './screener_engine.js';
-import { resolveMetrics } from './screener_data.js';
+import { resolveMetrics, yahooSummary, sameCompany } from './screener_data.js';
 import { cachedValue, TTL, resetStats, statsSnapshot } from './screener_cache.js';
 
 const MODEL = 'gemini-2.5-flash';
@@ -45,19 +45,41 @@ async function gemini(env, body) {
 }
 
 /**
+ * Who `symbol` actually is, in words a search engine cannot misread.
+ *
+ * The prompt used to say only "the company with ticker ZEAL.CO". Search
+ * grounding read that as "ZEAL" and researched ZEAL Network SE (a German
+ * lottery broker, XETRA: TIMA) instead of Zealand Pharma A/S — six confident,
+ * well-cited, wrong qualitative scores on top of correct Yahoo numbers, and a
+ * STRONG BUY. A bare ticker is not an identity; name + exchange is.
+ */
+function identityLine(symbol, id) {
+  if (!id?.name) return `the company with ticker ${symbol}`;
+  return `${id.name} (ticker ${symbol}${id.exchange ? `, listed on ${id.exchange}` : ''}` +
+         `${id.currency ? `, quoted in ${id.currency}` : ''})`;
+}
+
+/**
  * Grounded research pass → prose + citations.
  *
  * Cached for 24h keyed on ticker + date. This is the expensive half (a live
  * web search plus a long generation) and qualitative judgements about moats
  * and TAM do not move day to day. The structuring pass below is deliberately
  * NOT cached, so edits to the rubric take effect on the next score.
+ *
+ * Key is v2: every v1 entry was produced from a ticker-only prompt and may
+ * describe the wrong company.
  */
-async function research(symbol, env, refresh) {
+async function research(symbol, id, env, refresh) {
   const day = new Date().toISOString().slice(0, 10);
-  return cachedValue(`ai-research:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
+  return cachedValue(`ai-research:v2:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
     const { text, sources } = await gemini(env, {
       contents: [{ parts: [{ text:
-        `Research the company with ticker ${symbol} using current sources. Today is ${day}.\n\n` +
+        `Research ${identityLine(symbol, id)} using current sources. Today is ${day}.\n\n` +
+        (id?.name
+          ? `IMPORTANT: research ONLY ${id.name}. Other companies may share a similar name or ticker ` +
+            `(including on other exchanges) — ignore them. If your sources describe a different company, say so.\n\n`
+          : '') +
         `Report concisely on each of these, citing recent facts:\n${RUBRIC_TEXT}\n\n` +
         `Also state the company's full name, GICS sector and industry. ` +
         `Be specific about how much of its addressable market the company has already captured — ` +
@@ -71,17 +93,19 @@ async function research(symbol, env, refresh) {
 }
 
 /** Ungrounded structuring pass → strict JSON. Not cached. */
-async function structure(symbol, notes, env) {
+async function structure(symbol, id, notes, env) {
   const props = { company: { type: 'STRING' }, sector: { type: 'STRING' }, industry: { type: 'STRING' } };
-  for (const id of AI_IDS) {
+  for (const cid of AI_IDS) {
     // 0/1/2 or -1 for "not enough information". We map -1 → null rather than
     // silently defaulting to 1, which is the bug that inflated every score.
-    props[`${id}_score`] = { type: 'INTEGER' };
-    props[`${id}_why`] = { type: 'STRING' };
+    props[`${cid}_score`] = { type: 'INTEGER' };
+    props[`${cid}_why`] = { type: 'STRING' };
   }
   const { text } = await gemini(env, {
     contents: [{ parts: [{ text:
-      `Given these research notes on ${symbol}, score each criterion.\n\n` +
+      `Given these research notes on ${identityLine(symbol, id)}, score each criterion.\n\n` +
+      `In \`company\`, return the full name of the company the NOTES actually describe — ` +
+      `not the name you were told — so a mismatch can be detected.\n\n` +
       `Use 2, 1 or 0 per the rubric. Use -1 ONLY when the notes genuinely do not ` +
       `support any judgement — never guess a middle score to fill a gap.\n\n` +
       `RUBRIC:${RUBRIC_TEXT}\n\nNOTES:\n${notes}`
@@ -100,29 +124,48 @@ export async function scoreTicker(symbol, env, refresh = false) {
   resetStats();
   const t0 = Date.now();
 
+  // Identity first. yahooSummary is cached (15m) and resolveMetrics calls it
+  // again immediately, so this costs one request at most and the second call
+  // is a cache hit. Without it the AI half has nothing but a ticker to go on.
+  const summary = await yahooSummary(symbol, refresh).catch(() => null);
+  const id = summary?.longName
+    ? { name: summary.longName, exchange: summary.exchange, currency: summary.currency }
+    : null;
+
   // Data and AI are independent — run them concurrently.
   const [metrics, ai] = await Promise.all([
     resolveMetrics(symbol, env, refresh).catch(e => ({ _diag: { fatal: String(e.message) } })),
     (async () => {
-      const { notes, sources } = await research(symbol, env, refresh);
-      const parsed = await structure(symbol, notes, env);
+      const { notes, sources } = await research(symbol, id, env, refresh);
+      const parsed = await structure(symbol, id, notes, env);
       return { parsed, sources };
     })().catch(e => ({ _err: String(e.message) })),
   ]);
+
+  // ── Did the AI research the company we asked about? ──
+  // Grounding can still wander to a namesake. When the name the notes describe
+  // clearly disagrees with Yahoo's, the six qualitative scores belong to some
+  // other company: drop them rather than blend them into this one's total.
+  const aiCompany = ai?.parsed?.company || null;
+  const identityMismatch = !!(id?.name && aiCompany && sameCompany(id.name, aiCompany) === false);
+  if (identityMismatch) {
+    ai.parsed = { company: aiCompany };
+    ai._err = `research described "${aiCompany}", not ${id.name} — AI criteria discarded`;
+  }
 
   const criteria = computeQuantCriteria(metrics);
 
   // Merge the AI half.
   const parsed = ai?.parsed || {};
-  for (const id of AI_IDS) {
-    const rawScore = parseInt(parsed[`${id}_score`]);
+  for (const cid of AI_IDS) {
+    const rawScore = parseInt(parsed[`${cid}_score`]);
     const score = (Number.isInteger(rawScore) && rawScore >= 0 && rawScore <= 2) ? rawScore : null;
-    criteria[id] = {
+    criteria[cid] = {
       score,
-      note: parsed[`${id}_why`] || (ai?._err ? `AI unavailable: ${ai._err}` : 'No assessment'),
+      note: parsed[`${cid}_why`] || (ai?._err ? `AI unavailable: ${ai._err}` : 'No assessment'),
       source: score === null ? 'none' : 'ai-grounded',
       confidence: score === null ? 'none' : 'medium',
-      ...RUBRIC[id],
+      ...RUBRIC[cid],
     };
   }
 
@@ -138,14 +181,18 @@ export async function scoreTicker(symbol, env, refresh = false) {
 
   return {
     ticker: symbol,
-    company: parsed.company || symbol,
+    // Yahoo's name is the identity; the AI's is only ever a fallback.
+    company: id?.name || parsed.company || symbol,
     sector: metrics._meta?.sector || parsed.sector || '',
     industry: metrics._meta?.industry || parsed.industry || '',
     criteria,
     ...agg,
     // roicBasis drives an explicit "engine unproven" flag — a cash-basis score
     // is a candidate for a closer look, not a track record.
-    red_flags: redFlags(criteria, { sgr, roicBasis }),
+    red_flags: [
+      ...redFlags(criteria, { sgr, roicBasis }),
+      ...(identityMismatch ? [`AI research described a different company (${aiCompany}) — qualitative scores dropped`] : []),
+    ],
     // Headline multibagger metrics — the numbers you actually want on the card.
     sgr: sgr === null ? null : Math.round(sgr * 1000) / 10,
     years_to_10x: y10 === null ? null : Math.round(y10),
@@ -155,6 +202,7 @@ export async function scoreTicker(symbol, env, refresh = false) {
     sources: ai?.sources || [],
     diagnostics: {
       ...(metrics._diag || {}),
+      identity: { yahoo: id?.name || null, exchange: id?.exchange || null, ai: aiCompany, mismatch: identityMismatch },
       elapsed_ms: Date.now() - t0,
       cache: statsSnapshot(),
     },

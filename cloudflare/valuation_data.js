@@ -61,9 +61,8 @@
 // ────────────────────────────────────────────────────────────────────────
 
 import { cachedJson, TTL, statsSnapshot } from './screener_cache.js';
-import { yahooSummary, yahooCrumb, secCik } from './screener_data.js';
+import { yahooSummary, yahooCrumb, secCik, setSecContact, secContactSet, secUserAgent } from './screener_data.js';
 
-const UA = 'InvestTracker/1.0 (labanos@gmail.com)';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // How far the reported diluted share count may sit from the market-implied
@@ -252,7 +251,7 @@ export async function valuationFacts(cik, refresh = false) {
   // is the slowest call in either chain (multi-MB, changes four times a year),
   // so a ticker that was screened today gets its valuation payload for free.
   const d = await cachedJson(`https://data.sec.gov/api/xbrl/companyfacts/CIK${padded}.json`,
-    { headers: { 'User-Agent': UA } },
+    { headers: { 'User-Agent': secUserAgent() } },
     { ttl: TTL.EDGAR, ms: 15000, refresh, key: `edgar:${padded}` });
 
   const pull = (aliases, singleFiling = false) => {
@@ -367,6 +366,7 @@ const toM = v => (typeof v === 'number' && isFinite(v)) ? v / 1e6 : null;
  * cheerfully invent the missing years.
  */
 export async function resolveValuationInputs(symbol, env, refresh = false) {
+  setSecContact(env?.SEC_CONTACT);
   const summary = await yahooSummary(symbol, refresh).catch(e => ({ _err: String(e.message) }));
   const marketOk = summary && !summary._err;
 
@@ -559,6 +559,7 @@ export async function resolveValuationInputs(symbol, env, refresh = false) {
     diagnostics: {
       edgar_cik: cik || null,
       edgar_ok: !!edgar,
+      sec_contact: secContactSet(),
       ts_ok: !!ts,
       ts_fields: ts ? Object.keys(ts) : [],
       market_ok: marketOk,
