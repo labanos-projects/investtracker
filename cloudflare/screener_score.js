@@ -8,13 +8,13 @@
 import { RUBRIC, computeQuantCriteria, aggregate, redFlags, sustainableGrowth, yearsToMultiple } from './screener_engine.js';
 import { resolveMetrics, yahooSummary, sameCompany } from './screener_data.js';
 import { cachedValue, TTL, resetStats, statsSnapshot } from './screener_cache.js';
+import { gemini, parseJson, resolveModel, supportsOnePass } from './gemini.js';
 
-const MODEL = 'gemini-2.5-flash';
-// google_search grounding and responseSchema are mutually exclusive on 2.5
-// ("controlled generation is not supported with google_search tool"), so we
-// research grounded, then structure ungrounded. gemini-3-flash-preview allows
-// both in one call — flip this when you move models.
-const GROUNDED_TWO_PASS = true;
+// The model is chosen per call (see gemini.js for DEFAULT_MODEL and the
+// allowlist). On 2.5, google_search grounding and responseSchema are mutually
+// exclusive, so the AI half is two passes: research grounded, then structure
+// ungrounded. On 3.x both fit in one call — `onePass` — but that has to earn
+// its place: if it costs the source citations, two passes stay.
 
 const AI_IDS = ['moat', 'runway', 'cap_alloc', 'industry', 'disclosure', 'insider_buy'];
 
@@ -25,24 +25,6 @@ const RUBRIC_TEXT = `
 - industry: Industry stability over a 15-25 year hold. 2=slow-changing. 1=some flux. 0=disruption risk within 5 years.
 - disclosure: Management transparency. 2=clear and candid. 1=adequate. 0=opaque, or restatements.
 - insider_buy: Recent insider behaviour. 2=net open-market buyers. 1=neutral. 0=net sellers.`;
-
-async function gemini(env, body) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${env.GEMINI_API_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({}));
-    throw new Error(`Gemini ${res.status}: ${e?.error?.message || 'unknown'}`);
-  }
-  const d = await res.json();
-  const parts = d.candidates?.[0]?.content?.parts || [];
-  return {
-    text: parts.filter(p => !p.thought).map(p => p.text || '').join(''),
-    sources: (d.candidates?.[0]?.groundingMetadata?.groundingChunks || [])
-      .map(c => c.web?.uri).filter(Boolean).slice(0, 8),
-  };
-}
 
 /**
  * Who `symbol` actually is, in words a search engine cannot misread.
@@ -59,41 +41,31 @@ function identityLine(symbol, id) {
          `${id.currency ? `, quoted in ${id.currency}` : ''})`;
 }
 
-/**
- * Grounded research pass → prose + citations.
- *
- * Cached for 24h keyed on ticker + date. This is the expensive half (a live
- * web search plus a long generation) and qualitative judgements about moats
- * and TAM do not move day to day. The structuring pass below is deliberately
- * NOT cached, so edits to the rubric take effect on the next score.
- *
- * Key is v2: every v1 entry was produced from a ticker-only prompt and may
- * describe the wrong company.
- */
-async function research(symbol, id, env, refresh) {
-  const day = new Date().toISOString().slice(0, 10);
-  return cachedValue(`ai-research:v2:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
-    const { text, sources } = await gemini(env, {
-      contents: [{ parts: [{ text:
-        `Research ${identityLine(symbol, id)} using current sources. Today is ${day}.\n\n` +
-        (id?.name
-          ? `IMPORTANT: research ONLY ${id.name}. Other companies may share a similar name or ticker ` +
-            `(including on other exchanges) — ignore them. If your sources describe a different company, say so.\n\n`
-          : '') +
-        `Report concisely on each of these, citing recent facts:\n${RUBRIC_TEXT}\n\n` +
-        `Also state the company's full name, GICS sector and industry. ` +
-        `Be specific about how much of its addressable market the company has already captured — ` +
-        `a dominant share of a mature market is a LOW score on runway even for an excellent business.`
-      }] }],
-      tools: [{ google_search: {} }],
-      generationConfig: { temperature: 0.2, maxOutputTokens: 4096 },
-    });
-    return { notes: text, sources };
-  });
+/** The research brief — shared by the two-pass and one-pass paths. */
+function researchPrompt(symbol, id, day) {
+  return `Research ${identityLine(symbol, id)} using current sources. Today is ${day}.\n\n` +
+    (id?.name
+      ? `IMPORTANT: research ONLY ${id.name}. Other companies may share a similar name or ticker ` +
+        `(including on other exchanges) — ignore them. If your sources describe a different company, say so.\n\n`
+      : '') +
+    `Report concisely on each of these, citing recent facts:\n${RUBRIC_TEXT}\n\n` +
+    `Also state the company's full name, GICS sector and industry. ` +
+    `Be specific about how much of its addressable market the company has already captured — ` +
+    `a dominant share of a mature market is a LOW score on runway even for an excellent business.`;
 }
 
-/** Ungrounded structuring pass → strict JSON. Not cached. */
-async function structure(symbol, id, notes, env) {
+const SCORING_RULES =
+  `Use 2, 1 or 0 per the rubric. Use -1 ONLY when the evidence genuinely does not ` +
+  `support any judgement — never guess a middle score to fill a gap.\n\n` +
+  `In \`company\`, return the full name of the company the evidence actually describes — ` +
+  `not the name you were told — so a mismatch can be detected.`;
+
+/**
+ * Every field `required`: an optional field in a responseSchema may simply be
+ * absent (see DATA_SOURCES.md — a valuation scenario once came back with no
+ * multiples at all).
+ */
+function scoreSchema() {
   const props = { company: { type: 'STRING' }, sector: { type: 'STRING' }, industry: { type: 'STRING' } };
   for (const cid of AI_IDS) {
     // 0/1/2 or -1 for "not enough information". We map -1 → null rather than
@@ -101,28 +73,69 @@ async function structure(symbol, id, notes, env) {
     props[`${cid}_score`] = { type: 'INTEGER' };
     props[`${cid}_why`] = { type: 'STRING' };
   }
-  const { text } = await gemini(env, {
-    contents: [{ parts: [{ text:
-      `Given these research notes on ${identityLine(symbol, id)}, score each criterion.\n\n` +
-      `In \`company\`, return the full name of the company the NOTES actually describe — ` +
-      `not the name you were told — so a mismatch can be detected.\n\n` +
-      `Use 2, 1 or 0 per the rubric. Use -1 ONLY when the notes genuinely do not ` +
-      `support any judgement — never guess a middle score to fill a gap.\n\n` +
-      `RUBRIC:${RUBRIC_TEXT}\n\nNOTES:\n${notes}`
-    }] }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: { type: 'OBJECT', properties: props },
-      maxOutputTokens: 4096,
-    },
-  });
-  return JSON.parse(text);
+  return { type: 'OBJECT', properties: props, required: Object.keys(props) };
 }
 
-export async function scoreTicker(symbol, env, refresh = false) {
+/**
+ * Grounded research pass → prose + citations.
+ *
+ * Cached for 24h keyed on model + ticker + date. This is the expensive half (a
+ * live web search plus a long generation) and qualitative judgements about
+ * moats and TAM do not move day to day. The model is in the key so a
+ * comparison run can never be served the other model's answer. The
+ * structuring pass below is deliberately NOT cached, so edits to the rubric
+ * take effect on the next score.
+ */
+async function research(symbol, id, env, refresh, model) {
+  const day = new Date().toISOString().slice(0, 10);
+  return cachedValue(`ai-research:v2:${model}:${symbol}:${day}`, TTL.AI_RESEARCH, refresh, async () => {
+    const r = await gemini(env, {
+      model, prompt: researchPrompt(symbol, id, day), grounded: true,
+      temperature: 0.2, thinkingLevel: 'medium', maxOutputTokens: 8192,
+    });
+    return { notes: r.text, sources: r.sources, searchQueries: r.searchQueries, usage: r.usage };
+  });
+}
+
+/** Ungrounded structuring pass → strict JSON. Not cached. */
+async function structure(symbol, id, notes, env, model) {
+  const r = await gemini(env, {
+    model,
+    prompt:
+      `Given these research notes on ${identityLine(symbol, id)}, score each criterion.\n\n` +
+      `${SCORING_RULES}\n\nRUBRIC:${RUBRIC_TEXT}\n\nNOTES:\n${notes}`,
+    schema: scoreSchema(),
+    temperature: 0, thinkingLevel: 'low', maxOutputTokens: 8192,
+  });
+  return { parsed: parseJson(r), usage: r.usage };
+}
+
+/**
+ * One grounded call that returns the scores directly (3.x only). Not cached:
+ * it IS the research, and caching it would also cache the rubric.
+ */
+async function researchAndScore(symbol, id, env, model) {
+  const day = new Date().toISOString().slice(0, 10);
+  const r = await gemini(env, {
+    model,
+    prompt: `${researchPrompt(symbol, id, day)}\n\nThen score each criterion.\n\n${SCORING_RULES}\n\n` +
+            `Each *_why must cite the specific recent facts behind the score.`,
+    grounded: true, schema: scoreSchema(),
+    thinkingLevel: 'medium', maxOutputTokens: 16384,
+  });
+  return { parsed: parseJson(r), sources: r.sources, searchQueries: r.searchQueries, usage: r.usage };
+}
+
+/**
+ * @param {object} [opts]
+ * @param {string}  [opts.model]    an ALLOWED_MODELS entry; default otherwise
+ * @param {boolean} [opts.onePass]  grounded research + JSON in one call (3.x)
+ */
+export async function scoreTicker(symbol, env, refresh = false, opts = {}) {
   resetStats();
   const t0 = Date.now();
+  const model = resolveModel(opts.model);
+  const onePass = !!opts.onePass && supportsOnePass(model);
 
   // Identity first. yahooSummary is cached (15m) and resolveMetrics calls it
   // again immediately, so this costs one request at most and the second call
@@ -136,9 +149,10 @@ export async function scoreTicker(symbol, env, refresh = false) {
   const [metrics, ai] = await Promise.all([
     resolveMetrics(symbol, env, refresh).catch(e => ({ _diag: { fatal: String(e.message) } })),
     (async () => {
-      const { notes, sources } = await research(symbol, id, env, refresh);
-      const parsed = await structure(symbol, id, notes, env);
-      return { parsed, sources };
+      if (onePass) return await researchAndScore(symbol, id, env, model);
+      const rs = await research(symbol, id, env, refresh, model);
+      const st = await structure(symbol, id, rs.notes, env, model);
+      return { parsed: st.parsed, sources: rs.sources, searchQueries: rs.searchQueries, usage: { research: rs.usage, structure: st.usage } };
     })().catch(e => ({ _err: String(e.message) })),
   ]);
 
@@ -203,6 +217,13 @@ export async function scoreTicker(symbol, env, refresh = false) {
     diagnostics: {
       ...(metrics._diag || {}),
       identity: { yahoo: id?.name || null, exchange: id?.exchange || null, ai: aiCompany, mismatch: identityMismatch },
+      ai: {
+        model, one_pass: onePass,
+        sources: (ai?.sources || []).length,
+        search_queries: (ai?.searchQueries || []).length,
+        usage: ai?.usage || null,
+        error: ai?._err || null,
+      },
       elapsed_ms: Date.now() - t0,
       cache: statsSnapshot(),
     },

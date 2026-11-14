@@ -25,8 +25,10 @@
 
 import { resolveValuationInputs } from './valuation_data.js';
 import { cachedValue, TTL, resetStats, statsSnapshot } from './screener_cache.js';
+import { gemini, resolveModel } from './gemini.js';
 
-const MODEL = 'gemini-2.5-flash';
+// The model is chosen per call — see gemini.js for DEFAULT_MODEL, the
+// allowlist, and which request fields each model generation accepts.
 
 // A blended fair value more than this far above the market is not a valuation,
 // it is a modelling error until proven otherwise. Kept deliberately loose — a
@@ -56,28 +58,27 @@ const EPS_DRIFT_WARN = 0.40;
 // usable trailing anchor is the same situation one layer up.
 const NO_ANCHOR_PE_MAX = 60;
 
-async function gemini(env, body) {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${env.GEMINI_API_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-  );
-  if (!res.ok) {
-    const e = await res.json().catch(() => ({}));
-    const code = e?.error?.code || res.status;
-    if (code === 429) throw new Error('Gemini quota exceeded — enable billing at aistudio.google.com or wait for quota reset');
-    throw new Error(`Gemini ${code}: ${(e?.error?.message || 'unknown').slice(0, 200)}`);
-  }
-  const d = await res.json();
-  const parts = d.candidates?.[0]?.content?.parts || [];
-  return {
-    text: parts.filter(p => !p.thought).map(p => p.text || '').join(''),
-    // MAX_TOKENS here means the JSON is truncated mid-value. Without this the
-    // caller sees only "Unterminated string in JSON at position 22419", which
-    // says nothing about why. See structure() for what that cost us.
-    finishReason: d.candidates?.[0]?.finishReason || null,
-    sources: (d.candidates?.[0]?.groundingMetadata?.groundingChunks || [])
-      .map(c => c.web?.uri).filter(Boolean).slice(0, 8),
-  };
+/**
+ * This file builds raw generateContent bodies; gemini.js owns the rules for
+ * what each model generation accepts (2.5: temperature; 3.x: thinkingLevel,
+ * no sampling parameters). This adapter is the seam between the two, so the
+ * prompts below did not have to be rewritten to change model.
+ *
+ * finishReason is passed through: MAX_TOKENS here means the JSON is truncated
+ * mid-value, and without it the caller sees only "Unterminated string in JSON
+ * at position 22419". See structure() for what that cost us.
+ */
+async function callGemini(env, model, body, thinkingLevel) {
+  const gc = body.generationConfig || {};
+  return gemini(env, {
+    model,
+    prompt: body.contents[0].parts[0].text,
+    grounded: !!body.tools,
+    schema: gc.responseSchema || null,
+    maxOutputTokens: gc.maxOutputTokens,
+    temperature: gc.temperature,
+    thinkingLevel,
+  });
 }
 
 const money = (v, unit) => v == null ? 'n/a' : `${Math.round(v).toLocaleString('en')}${unit}`;
@@ -101,17 +102,20 @@ function actualsTable(rows, ccy) {
  * hour. The structuring pass below is deliberately NOT cached, so edits to the
  * assumption rules take effect on the next generate.
  */
-async function research(inputs, env, refresh) {
+async function research(inputs, env, refresh, model) {
   const day = new Date().toISOString().slice(0, 10);
   const { symbol, currency: ccy } = inputs;
 
   // Cache key carries a version. v3 retires every v2 answer because those were
   // produced under a 4096-token budget that was truncating the PE_RANGE_5Y
   // line off the end of the reply — a cached v2 result is a cached failure.
-  const key = `valuation-research:v3:${symbol}:${day}`;
+  //
+  // The model is in the key so a comparison run can never be served the other
+  // model's research.
+  const key = `valuation-research:v3:${model}:${symbol}:${day}`;
 
   const produce = async () => {
-    const { text, sources, finishReason } = await gemini(env, {
+    const { text, sources, finishReason } = await callGemini(env, model, {
       contents: [{ parts: [{ text:
 `You are an equity analyst preparing the forward assumptions for a 5-year DCF on ${symbol}${inputs.company ? ` (${inputs.company})` : ''}. Today is ${day}.
 
@@ -151,7 +155,7 @@ This line is the single most load-bearing output of this whole pass. If it is mi
       // `research()` used to throw finishReason away, so the truncation was
       // invisible. See NO_ANCHOR_PE_MAX for what that cost downstream.
       generationConfig: { temperature: 0.2, maxOutputTokens: 8192 },
-    });
+    }, 'medium');
     // Pulled out of the prose so the structuring pass gets a number rather than
     // a paragraph. Question 4 already asked for the range, but a range buried in
     // four sentences of commentary is a range the next prompt can ignore — and
@@ -228,7 +232,7 @@ function scenarioProblems(parsed) {
 }
 
 /** Ungrounded structuring pass → strict JSON. Not cached. */
-async function structure(inputs, notes, env, peRange) {
+async function structure(inputs, notes, env, peRange, model) {
   const y0 = inputs.actuals[inputs.actuals.length - 1];
   const gm0 = y0.gross_profit && y0.revenue ? (y0.gross_profit / y0.revenue) : null;
   const om0 = y0.op_income && y0.revenue ? (y0.op_income / y0.revenue) : null;
@@ -335,7 +339,9 @@ ${notes}` }] }],
   // grounded research pass because one scenario came back short is a bad trade.
   let lastProblems = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const { text, finishReason } = await gemini(env, buildRequest(attempt === 2 ? lastProblems.join('; ') : null));
+    // 'medium', not 'low': with reasoning switched off, 2.5 dropped whole fields
+    // while juggling the multiple rules (NOW's bear scenario, see above).
+    const { text, finishReason } = await callGemini(env, model, buildRequest(attempt === 2 ? lastProblems.join('; ') : null), 'medium');
 
     // responseMimeType should preclude code fences, but a stray one costs a
     // whole generation to discover, so strip them before parsing, not after.
@@ -411,8 +417,9 @@ const normalise = (arr, key) => {
  * the old code swallowed failures and the result was thirteen invented models
  * nobody could tell apart from real ones.
  */
-export async function generateValuation(symbol, env, { currentPrice = null, portfolioId = 0, refresh = false } = {}) {
+export async function generateValuation(symbol, env, { currentPrice = null, portfolioId = 0, refresh = false, model: requestedModel = null } = {}) {
   resetStats();
+  const model = resolveModel(requestedModel);
   const t0 = Date.now();
   const today = new Date().toISOString().split('T')[0];
 
@@ -440,7 +447,7 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
   }
   if (inputs.reconciliation.status === 'warn') flags.push('share_count_drift');
 
-  const { notes, sources, peRange, finishReason: researchFinish } = await research(inputs, env, refresh);
+  const { notes, sources, peRange, finishReason: researchFinish } = await research(inputs, env, refresh, model);
 
   // ── No observed multiple range ────────────────────────────────────────────
   //
@@ -469,7 +476,7 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
     flags.push('no_observed_pe_range');
   }
 
-  const parsed = await structure(inputs, notes, env, peRange);
+  const parsed = await structure(inputs, notes, env, peRange, model);
 
   const y0 = inputs.actuals[inputs.actuals.length - 1];
 
@@ -594,7 +601,7 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
     currency: inputs.currency,
     notes:
       `AI-generated ${today} — actuals from filings (${provenance || 'unknown'}), ` +
-      `assumptions from search-grounded Gemini. ` +
+      `assumptions from search-grounded ${model}. ` +
       `FY${y0.fiscal_year} baseline ended ${inputs.y0_period_end} (${inputs.months_since_y0}m ago). ` +
       `Price ${price} ${inputs.quote_currency || ''}, trailing P/E ` +
       `${inputs.pe_trailing != null ? inputs.pe_trailing.toFixed(1) + 'x' : 'n/a'}. ` +
@@ -613,6 +620,7 @@ export async function generateValuation(symbol, env, { currentPrice = null, port
       // away, which is the only reason 11 consecutive models could degrade to
       // an unchecked ceiling without anyone being able to say why.
       research_finish_reason: researchFinish || null,
+      ai_model: model,
       base_multiple_ceiling: multCeiling ?? null,
       margin_uplift: Math.round(marginUplift * 100) / 100,
       margin_adjusted_ceiling: adjustedCeiling != null ? Math.round(adjustedCeiling * 10) / 10 : null,
