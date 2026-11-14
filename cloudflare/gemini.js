@@ -14,14 +14,25 @@
 //         sent. Reasoning depth is `thinkingConfig.thinkingLevel` — low,
 //         medium or high; `minimal` is rejected on 3.8 Flash.
 //
-// Known 3.x caveat, reported by other developers and to be confirmed against
-// our own traffic: with search + schema in ONE call, groundingMetadata may
-// carry the search queries but no groundingChunks — i.e. no source URLs. The
-// result reports `searchQueries` alongside `sources` so that is measurable.
+// One-pass (search + schema in ONE call) was measured on 2026-11-14 against
+// NOVO-B.CO, ZEAL.CO, MSFT and ROCK-B.CO and REJECTED: in 3 of 4 runs 3.8
+// Flash issued no search at all (0 queries, 0 sources) and scored from memory
+// — exactly the recalled-not-observed failure the grounded pass exists to
+// prevent. Two passes searched every time. `onePass` stays available behind
+// ?onepass=1 so a future model can be re-measured, but nothing defaults to it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // What runs when nobody asks for anything else.
-export const DEFAULT_MODEL = 'gemini-2.5-flash';
+//
+// 3.8 Flash since 2026-11-14, after a side-by-side on the four tickers above
+// (screener) and MSFT (valuation), both models two-pass. Totals moved by at
+// most ±5 points and every run stayed grounded; the difference was in the
+// judgement. On Novo, 2.5 scored industry stability 2 on "pharma is stable";
+// 3.8 scored it 1 citing patent-cliff cycles and pricing pressure. 3.8's notes
+// and DCF rationales carried figures (penetration rates, growth and margin
+// assumptions) where 2.5 wrote generic sentences. Valuation upside on MSFT:
+// +40.7% (2.5) vs +39.7% (3.8), no flags on either.
+export const DEFAULT_MODEL = 'gemini-3.8-flash';
 
 // Models a request may select with ?model= for side-by-side comparison. An
 // allowlist, so a query string can never send an arbitrary model name (or a

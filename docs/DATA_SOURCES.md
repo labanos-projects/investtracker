@@ -19,10 +19,11 @@ walks its own waterfall and records `source` + `confidence`, surfaced in the UI.
 | Yahoo `fundamentals-timeseries` | free | statements, incl. non-SEC names |
 | FMP `key-metrics-ttm` | 250/day free | gap-fill only |
 | Frankfurter (ECB) | free, no key | FX → USD |
-| Gemini 2.5 Flash + `google_search` | included | qualitative judgement only |
+| Gemini 3.8 Flash + `google_search` (via `gemini.js`) | Gemini API, per token | qualitative judgement only |
 
 EDGAR requires a descriptive `User-Agent` with contact email — that's a
-condition of use, not a courtesy.
+condition of use, not a courtesy. The address is the `SEC_CONTACT` Worker
+secret, never source; `diagnostics.sec_contact` says whether it was set.
 
 ## Yahoo Finance is proxied via Cloudflare Worker
 
@@ -179,13 +180,31 @@ than the last annual report.
 None of these failures is loud. All three produce plausible, confident, wrong
 output — NVDA's PEG read 4.74 when it should have been ~0.29.
 
-## Gemini: search grounding and structured output are mutually exclusive on 2.5
+## Gemini: model choice, and why both engines stay two-pass
 
-`tools: [{google_search: {}}]` with `responseMimeType: 'application/json'`
-fails: *"controlled generation is not supported with google_search tool"*. Both
-engines therefore do a **grounded research pass** (prose + citations) then an
-**ungrounded structuring pass** (strict `responseSchema`). Gemini 3 models allow
-both in one call — see `MODEL` in `screener_score.js` and `valuation_model.js`.
+All Gemini traffic goes through `cloudflare/gemini.js`, which owns the
+per-generation rules. Default model: **`gemini-3.8-flash`** (since 2026-11-14;
+the measurement behind that is in the comment on `DEFAULT_MODEL`).
+
+- **2.5:** `tools: [{google_search: {}}]` with `responseMimeType:
+  'application/json'` fails: *"controlled generation is not supported with
+  google_search tool"*. Takes `temperature`.
+- **3.x:** search and schema may be combined in one call. Sampling parameters
+  (`temperature`/`top_p`/`top_k`) are deprecated and not sent; reasoning depth
+  is `thinkingConfig.thinkingLevel` (`low`/`medium`/`high` — `minimal` is
+  rejected on 3.8 Flash).
+
+Both engines still do a **grounded research pass** (prose + citations) then an
+**ungrounded structuring pass** (strict `responseSchema`), even on 3.8. The
+single-call path was measured and rejected: in 3 of 4 tickers it issued **no
+search at all** and scored from memory, with nothing in the output saying so
+except `diagnostics.ai.search_queries: 0`. It remains behind `?onepass=1` for
+re-measuring a future model.
+
+**Comparing models without touching stored data:** both AI endpoints accept
+`?model=` (allowlist in `gemini.js`), `?onepass=1` (screener) and `?dry=1`. Any
+of them makes the run a trial — returned, never saved. Research cache keys
+include the model, so a trial never receives the other model's cached answer.
 
 Two schema traps, both found in production:
 
