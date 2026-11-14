@@ -51,9 +51,14 @@
 //       follow a batch-level verdict instead. Without it, base-currency
 //       conversion would have run on frozen rates all afternoon while every
 //       equity row was fresh.
+// v25 – Gemini calls go through gemini.js, and both AI endpoints accept
+//       ?model= (allowlisted), ?onepass=1 (screener) and ?dry=1. Any of them
+//       makes the run a trial that is returned but never saved, so models can
+//       be compared on live data without overwriting stored results.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
+import { ALLOWED_MODELS } from './gemini.js';
 import { companyNews } from './news.js';
 
 // How long a Cloudflare colo may reuse a Yahoo quote response.
@@ -68,6 +73,21 @@ const bust = () => `&_cb=${Math.floor(Date.now() / 60000)}`;
 // own refresh trigger adds up to five more, so a smaller margin would have the
 // two sources trading places all day for no benefit.
 const FRESHER_BY_SECONDS = 900;
+
+// ── Comparison mode (both AI endpoints) ──────────────────────────────────────
+// ?model=<allowlisted> picks the Gemini model, ?onepass=1 the screener's
+// single-call path, ?dry=1 neither. ANY of them makes the run a trial: the
+// result is returned but never saved, so comparing models can never overwrite
+// a stored score or valuation. Returns { model, onePass, dry } or { error }.
+function trialParams(url) {
+  const model = url.searchParams.get('model') || null;
+  if (model && !ALLOWED_MODELS.includes(model)) {
+    return { error: `Unknown model "${model}" — allowed: ${ALLOWED_MODELS.join(', ')}` };
+  }
+  const onePass = url.searchParams.get('onepass') === '1';
+  const dry = url.searchParams.get('dry') === '1' || !!model || onePass;
+  return { model, onePass, dry };
+}
 
 export default {
   async fetch(request, env) {
@@ -100,6 +120,13 @@ export default {
         });
       }
 
+      const trial = trialParams(url);
+      if (trial.error) {
+        return new Response(JSON.stringify({ error: trial.error }), {
+          status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+
       const portfolioId  = parseInt(url.searchParams.get('portfolio_id') || '0');
       const currentPrice = parseFloat(url.searchParams.get('current_price') || '0');
       const refresh      = url.searchParams.get('refresh') === '1';
@@ -112,7 +139,7 @@ export default {
         const yhParam  = (url.searchParams.get('yh_symbol') || '').toUpperCase().trim();
         const symbol   = yhParam || storeAs;
 
-        const result = await generateValuation(symbol, env, { currentPrice, portfolioId, refresh });
+        const result = await generateValuation(symbol, env, { currentPrice, portfolioId, refresh, model: trial.model });
 
         // A model that survives the reconciliation gate is wrong in its
         // judgement; one that fails it is wrong in its arithmetic, and only the
@@ -131,6 +158,17 @@ export default {
         if (result.diagnostics) {
           result.diagnostics.resolved_symbol = symbol;
           result.diagnostics.stored_as = storeAs;
+        }
+
+        if (trial.dry) {
+          return new Response(JSON.stringify({
+            dry_run: true,
+            persisted: false,
+            payload: result.payload,
+            data_quality: result.quality,
+            flags: result.flags,
+            diagnostics: result.diagnostics,
+          }), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
         }
 
         const saveRes = await fetch('https://labanos.dk/valuations.php', {
@@ -287,8 +325,20 @@ export default {
 
       const symbol = scoreTickerSym.toUpperCase().trim();
       const refresh = url.searchParams.get('refresh') === '1';
+      const trial = trialParams(url);
+      if (trial.error) {
+        return new Response(JSON.stringify({ error: trial.error }), {
+          status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
       try {
-        const scoreResult = await scoreTicker(symbol, env, refresh);
+        const scoreResult = await scoreTicker(symbol, env, refresh, { model: trial.model, onePass: trial.onePass });
+
+        if (trial.dry) {
+          scoreResult.dry_run = true;
+          scoreResult.persisted = false;
+          return new Response(JSON.stringify(scoreResult), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+        }
 
         let persisted = false, persistStatus = null, persistError = null;
         try {
