@@ -26,8 +26,8 @@
 //  3. CIK resolution falls back to company-name matching. "NOVO-B.CO" reduces
 //     to "NOVO" but Novo Nordisk's ADR is "NVO", so the ticker-root lookup
 //     missed it and the whole 20-F/IFRS path went unused. The ticker-ROOT
-//     match now requires the SEC name to agree: "ZEAL.CO" (Zealand Pharma)
-//     rooted to a US filer called ZEAL and would have taken its filings.
+//     match now also requires the SEC name to agree, so a suffixed symbol
+//     can never borrow a US namesake's filings.
 //
 //  4. Every upstream goes through screener_cache.js. ?refresh=1 bypasses it.
 //
@@ -236,10 +236,11 @@ async function loadSecMaps(refresh = false) {
  * "NOVONORDISK" finds CIK 353278 and unlocks the IFRS branch.
  *
  * The ticker-ROOT match is only trusted when the SEC entity's name agrees with
- * the company name. A root is not an identity: "ZEAL.CO" (Zealand Pharma)
- * roots to "ZEAL", which is a different US filer entirely (CIK 2068427). EDGAR
- * outranks Yahoo in every waterfall, so an unchecked root match would replace
- * correct Yahoo figures with another company's audited ones — confidently.
+ * the company name. A root is not an identity: "XYZ.CO" and a US "XYZ" can be
+ * different companies, and EDGAR outranks Yahoo in every waterfall, so an
+ * unchecked root match would replace correct Yahoo figures with another
+ * company's audited ones — confidently. (ZEAL.CO → ZEAL, CIK 2068427, passes
+ * this check: the SEC entity is Zealand itself. Verified 2026-11-14.)
  */
 export async function secCik(symbol, companyName, refresh = false) {
   await loadSecMaps(refresh);
@@ -536,8 +537,8 @@ export async function resolveMetrics(symbol, env, refresh = false) {
   // ── FMP last: free tier, partial endpoint coverage, so gap-fill only ──
   if (env?.FMP_API_KEY && !m.roic) {
     try {
-      // The full symbol, suffix included. Stripping ".CO" turned ZEAL.CO into
-      // ZEAL — a different, US-listed company. FMP uses the same exchange
+      // The full symbol, suffix included. Stripping the exchange suffix can
+      // land on a US namesake with a different business. FMP uses the same
       // suffixes as Yahoo; an unknown symbol returns nothing, which is honest.
       const fmpSym = symbol;
       // Cached hardest of all — this is the only metered upstream (250/day),
