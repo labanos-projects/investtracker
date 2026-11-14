@@ -38,7 +38,11 @@ jobs:
             GEMINI_API_KEY
             FMP_API_KEY
             GSHEET_URL
+            SEC_CONTACT
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
           GSHEET_URL: ${{ secrets.GSHEET_URL }}
+          # Contact address for the SEC EDGAR User-Agent (required by SEC).
+          # Kept out of source on purpose — see screener_data.js.
+          SEC_CONTACT: ${{ secrets.SEC_CONTACT }}
