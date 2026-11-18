@@ -14,6 +14,7 @@ function App() {
   const [fetchedAt, setFetchedAt]     = useState(null);
   const [sortBy, setSortBy]           = useState('value');
   const [sortDir, setSortDir]         = useState('desc');
+  const [sortMetric, setSortMetric]   = useState('pct'); // 'pct' | 'abs' — for Today and G/L
   const [notice, setNotice]           = useState(null);
   // A single route for the shared company page. Holdings, Watchlist and
   // Screener all open the same TickerPage; `origin` only decides the label on
@@ -454,16 +455,23 @@ function App() {
   const sortFn = (a, b) => {
     let diff = 0;
     if (sortBy === 'value') diff = b.valueBase - a.valueBase;
-    if (sortBy === 'today') diff = b.chgPct - a.chgPct;
-    if (sortBy === 'gl')    diff = b.glPct - a.glPct;
+    const abs = sortMetric === 'abs';
+    if (sortBy === 'today') diff = abs ? b.todayBase - a.todayBase : b.chgPct - a.chgPct;
+    if (sortBy === 'gl')    diff = abs ? b.glBase - a.glBase       : b.glPct - a.glPct;
     return sortDir === 'asc' ? -diff : diff;
   };
   const sortedActive = [...activePositions].sort(sortFn);
   const sortedClosed = [...closedPositions].sort(sortFn);
 
+  // Today and G/L show both % and absolute, so their header cycles through four
+  // states: % ↓ → % ↑ → abs ↓ → abs ↑ → back to % ↓. Value keeps the plain toggle.
+  const DUAL_COLS = ['today', 'gl'];
   const handleSort = (col) => {
-    if (col === sortBy) { setSortDir(d => d === 'desc' ? 'asc' : 'desc'); }
-    else { setSortBy(col); setSortDir('desc'); }
+    if (col !== sortBy) { setSortBy(col); setSortDir('desc'); setSortMetric('pct'); return; }
+    if (!DUAL_COLS.includes(col)) { setSortDir(d => d === 'desc' ? 'asc' : 'desc'); return; }
+    if (sortDir === 'desc') { setSortDir('asc'); return; }
+    setSortDir('desc');
+    setSortMetric(m => m === 'pct' ? 'abs' : 'pct');
   };
 
   const SortBtn = ({ col, label }) => (
@@ -471,7 +479,9 @@ function App() {
       className={`px-3 py-2 text-right cursor-pointer select-none text-xs ${sortBy===col ? 'text-gray-700 font-semibold' : 'text-gray-400 font-normal'}`}
       onClick={() => handleSort(col)}
     >
-      {label}{sortBy===col ? (sortDir === 'desc' ? ' ↓' : ' ↑') : ''}
+      {label}{sortBy===col
+        ? (DUAL_COLS.includes(col) ? (sortMetric === 'abs' ? ' abs' : ' %') : '') + (sortDir === 'desc' ? ' ↓' : ' ↑')
+        : ''}
     </th>
   );
 
