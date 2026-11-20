@@ -13,8 +13,11 @@
 //   etf        — the index's real weights, from an iShares ETF holdings file
 //                (SP500, NDX, DAX). Free-float and capping included.
 //   price      — price at previous close (DJI, which is price-weighted).
-//   cap-capped — full market cap at previous close, 15% issuer cap (OMXC25:
-//                no free source publishes its weights).
+//   published  — the provider's own monthly weight file, as of its date
+//                (OMXC25 — no ETF tracks the plain C25). See PUBLISHED_WEIGHTS.
+//   cap-capped — full market cap at previous close, 15% issuer cap. Only a
+//                fallback: for C25 it put Nordea at 12% against an actual 1.4%,
+//                because Nasdaq weights by free float.
 //   cap        — full market cap; fallback when an ETF file is unavailable.
 //
 // The response returns Σ contribution as `explained` next to the index's own
@@ -49,7 +52,7 @@ const STATIC = {
   // MAERSK-A is a member but is folded into MAERSK-B (one issuer, see
   // DUAL_CLASS_DROP and the 15% issuer cap).
   OMXC25: [
-    'MAERSK-A','MAERSK-B','SYDB','ALSYDB','AMBU-B','CARL-B','COLO-B','DANSKE','DEMANT','DSV','FLS',
+    'MAERSK-A','MAERSK-B','ALSYDB','AMBU-B','CARL-B','COLO-B','DANSKE','DEMANT','DSV','FLS',
     'GMAB','GN','ISS','JYSK','NKT','NDA-DK','NOVO-B','NSIS-B','ORSTED','PNDORA',
     'ROCK-B','RBREW','TRYG','VWS','ZEAL',
   ].map(s => `${s}.CO`),
@@ -106,6 +109,27 @@ const STATIC = {
     'FOXA','FOX','WBD','DVN','MRNA','ALB','BF-B','PSKY','NRG','HUBB','COO','ZM','DELL','APP','WSM','TKO',
     'EXE','LII','DDOG','COIN','HOOD','IBKR','XYZ','TTD','WDAY',
   ],
+};
+
+// ── Published index weights ──────────────────────────────────────────────────
+// Nasdaq publishes C25's weights once a month for UCITS compliance:
+// https://www.nasdaq.com/docs/global-indexes/OMXC25 ("Data as of"). Checked
+// against 2026-11-20: these weights explained −1.281% of a −1.273% day, where
+// capped market cap explained −1.203%. Refresh monthly; when this goes stale
+// the error grows with price drift but stays far below the market-cap estimate.
+const PUBLISHED_WEIGHTS = {
+  OMXC25: {
+    asOf: '2026-11-02',
+    source: 'Nasdaq OMXC25 weights',
+    suffix: '.CO',
+    weights: {
+      'MAERSK-A': 3.54, 'MAERSK-B': 3.25, 'ALSYDB': 2.52, 'AMBU-B': 0.69, 'CARL-B': 4.21,
+      'COLO-B': 3.37, 'DANSKE': 9.69, 'DEMANT': 1.45, 'DSV': 12.50, 'FLS': 1.05,
+      'GMAB': 10.42, 'GN': 0.66, 'ISS': 1.63, 'JYSK': 2.00, 'NKT': 2.06,
+      'NDA-DK': 1.42, 'NOVO-B': 12.70, 'NSIS-B': 7.28, 'ORSTED': 3.31, 'PNDORA': 2.94,
+      'ROCK-B': 0.87, 'RBREW': 0.86, 'TRYG': 2.21, 'VWS': 8.72, 'ZEAL': 0.68,
+    },
+  },
 };
 
 // FMP constituent lists — second fallback for the US indices, behind the ETF
@@ -291,12 +315,19 @@ export async function indexMovers(key, env, refresh = false) {
     let etf = null, etfError = null;
     try { etf = await etfHoldings(key, refresh); } catch (e) { etfError = String(e.message || e).slice(0, 120); }
 
-    let syms, source, fileWeight = null, weightsBasis;
-    if (etf) {
-      fileWeight = new Map(etf.holdings.map(h => [h.symbol.toUpperCase(), h]));
+    // 2) Otherwise the provider's published monthly weights, if we carry them.
+    const pub = !etf && PUBLISHED_WEIGHTS[key];
+
+    let syms, source, fileWeight = null, weightsBasis, asOf = null;
+    if (etf || pub) {
+      const holdings = etf
+        ? etf.holdings
+        : Object.entries(pub.weights).map(([t, w]) => ({ symbol: t + (pub.suffix || ''), name: t, weight: w / 100 }));
+      fileWeight = new Map(holdings.map(h => [h.symbol.toUpperCase(), h]));
       syms = [...fileWeight.keys()];
-      source = `${etf.fund} holdings`;
-      weightsBasis = 'etf';
+      source = etf ? `${etf.fund} holdings` : pub.source + (etfError ? ` (etf: ${etfError})` : '');
+      weightsBasis = etf ? 'etf' : 'published';
+      asOf = etf ? etf.asOf : pub.asOf;
     } else {
       const c = await constituents(key, env, refresh);
       syms = [...new Set(c.symbols)].filter(s => !DUAL_CLASS_DROP.has(s));
@@ -329,7 +360,7 @@ export async function indexMovers(key, env, refresh = false) {
       if (index.quoteTime && q.regularMarketTime && index.quoteTime - q.regularMarketTime > 7 * 86400) { unpriced.push(s); continue; }
       const r = price / prev - 1;
       let base;
-      if (weightsBasis === 'etf') base = fileWeight.get(s.toUpperCase()).weight;
+      if (fileWeight) base = fileWeight.get(s.toUpperCase()).weight;
       else if (weightsBasis === 'price') base = prev;
       else {
         if (!q.marketCap) { unpriced.push(s); continue; }
@@ -364,10 +395,10 @@ export async function indexMovers(key, env, refresh = false) {
       key,
       weighting: def.weighting,
       weights: {
-        basis: weightsBasis,                                   // etf | cap | cap-capped | price
+        basis: weightsBasis,                       // etf | published | cap | cap-capped | price
         source,
-        asOf: etf?.asOf ?? null,
-        coveredInFile: etf ? items.reduce((a, x) => a + (fileWeight.get(x.symbol.toUpperCase())?.weight || 0), 0) : null,
+        asOf,
+        coveredInFile: fileWeight ? items.reduce((a, x) => a + (fileWeight.get(x.symbol.toUpperCase())?.weight || 0), 0) : null,
       },
       index,
       explained,

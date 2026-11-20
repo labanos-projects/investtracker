@@ -158,7 +158,7 @@ const IndexMovers = ({ idx, ownedSet, onOpenTicker }) => {
       <div className="flex items-center justify-between text-[10px] text-gray-400">
         <span title={data.weights?.source || ''}>
           {data.coverage?.priced}/{data.coverage?.listed} constituents priced · {
-            data.weights?.basis === 'etf'        ? `weights from ${data.weights.source}${data.weights.asOf ? ` (${data.weights.asOf})` : ''}`
+            ['etf', 'published'].includes(data.weights?.basis) ? `weights from ${data.weights.source}${data.weights.asOf ? ` (${data.weights.asOf})` : ''}`
           : data.weights?.basis === 'price'      ? 'price-weighted'
           : data.weights?.basis === 'cap-capped' ? 'weights ≈ market cap, 15% issuer cap'
           :                                        'weights ≈ market cap'}
