@@ -60,6 +60,7 @@ All endpoints return JSON. Write operations require `Authorization: Bearer <user
 | `?search=novo nordisk` | Ticker autocomplete |
 | `?news=AAPL` | Latest news headlines |
 | `?generate_valuation=AAPL&portfolio_id=1[&current_price=...][&refresh=1]` | AI DCF valuation (Bearer-auth). Actuals from filings, assumptions from grounded Gemini. 422 = inputs failed the reconciliation gate and nothing was saved. See [VALUATION.md](VALUATION.md). |
+| `?index_movers=SP500[&refresh=1]` | Index constituents ranked by contribution (weight × return) for `SP500`, `NDX`, `DJI`, `OMXC25`. Returns `index`, `explained` (Σ contributions — compare with `index.chgPct`), `breadth`, `coverage`, `constituents[]` and `diagnostics`. See `cloudflare/markets.js`. |
 | `?score_ticker=NVDA[&refresh=1]` | Screener score (Bearer-auth). `refresh=1` bypasses all caches. See [SCREENER.md](SCREENER.md). |
 
 Chart ranges: `1d`, `5d`, `1mo`, `3mo`, `6mo`, `1y`, `2y`, `5y`, `max`.
