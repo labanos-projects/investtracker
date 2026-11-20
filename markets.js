@@ -10,7 +10,7 @@ const MARKET_INDICES = [
   { key: 'OMXC25',  symbol: '^OMXC25',   name: 'OMX C25',       movers: true  },
   { key: 'IXIC',    symbol: '^IXIC',     name: 'Nasdaq Comp.',  movers: false },
   { key: 'STOXX50', symbol: '^STOXX50E', name: 'Euro Stoxx 50', movers: false },
-  { key: 'DAX',     symbol: '^GDAXI',    name: 'DAX',           movers: false },
+  { key: 'DAX',     symbol: '^GDAXI',    name: 'DAX',           movers: true  },
 ];
 
 const fmtLevel = (v) => v == null || isNaN(v) ? '–'
@@ -126,7 +126,7 @@ const IndexMovers = ({ idx, ownedSet, onOpenTicker }) => {
         <div className="px-2 py-2 border-r border-gray-100">
           <div className="text-[10px] text-gray-400 uppercase tracking-wide">Index</div>
           <div className={`mono font-bold text-[14px] ${clr(data.index?.chgPct)}`}>{pct(data.index?.chgPct)}</div>
-          <div className="text-[10px] text-gray-400" title="Sum of weight × return over the constituents priced. The gap to the index move is the approximation error: weights here are full market cap, not the provider's free-float/capped weights.">
+          <div className="text-[10px] text-gray-400" title="Sum of weight × return over the constituents priced. The gap to the index move is the approximation error — small with ETF weights, larger where weights are estimated from market cap.">
             model {pct(data.explained)}
           </div>
         </div>
@@ -156,7 +156,13 @@ const IndexMovers = ({ idx, ownedSet, onOpenTicker }) => {
       </div>
 
       <div className="flex items-center justify-between text-[10px] text-gray-400">
-        <span>{data.coverage?.priced}/{data.coverage?.listed} constituents priced · weights ≈ market cap at previous close</span>
+        <span title={data.weights?.source || ''}>
+          {data.coverage?.priced}/{data.coverage?.listed} constituents priced · {
+            data.weights?.basis === 'etf'        ? `weights from ${data.weights.source}${data.weights.asOf ? ` (${data.weights.asOf})` : ''}`
+          : data.weights?.basis === 'price'      ? 'price-weighted'
+          : data.weights?.basis === 'cap-capped' ? 'weights ≈ market cap, 15% issuer cap'
+          :                                        'weights ≈ market cap'}
+        </span>
         <button onClick={() => setCount(c => c === 10 ? 25 : 10)} className="underline">
           {count === 10 ? 'Show 25' : 'Show 10'}
         </button>
@@ -227,7 +233,7 @@ const MarketsView = ({ holdings, onOpenTicker }) => {
       {sel.movers
         ? <IndexMovers key={sel.key} idx={sel} ownedSet={ownedSet} onOpenTicker={onOpenTicker} />
         : <div className="px-4 py-6 text-center text-[12px] text-gray-400">
-            Constituent breakdown is available for S&P 500, Nasdaq 100, Dow Jones and OMX C25.
+            Constituent breakdown is available for S&P 500, Nasdaq 100, Dow Jones, OMX C25 and DAX.
           </div>}
     </div>
   );
