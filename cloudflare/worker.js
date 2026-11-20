@@ -55,11 +55,15 @@
 //       ?model= (allowlisted), ?onepass=1 (screener) and ?dry=1. Any of them
 //       makes the run a trial that is returned but never saved, so models can
 //       be compared on live data without overwriting stored results.
+// v26 – ?index_movers=SP500|NDX|DJI|OMXC25 : constituents ranked by their
+//       contribution to the index move (weight × return), not by raw % change.
+//       See markets.js.
 import { scoreTicker } from './screener_score.js';
 import { yahooSummary } from './screener_data.js';
 import { generateValuation } from './valuation_model.js';
 import { ALLOWED_MODELS } from './gemini.js';
 import { companyNews } from './news.js';
+import { indexMovers, INDEX_DEFS } from './markets.js';
 
 // How long a Cloudflare colo may reuse a Yahoo quote response.
 const QUOTE_CACHE_TTL = 60;
@@ -364,6 +368,25 @@ export default {
       }
     }
 
+    // ── Index movers: ?index_movers=SP500 ────────────────────────────────────────────────
+    const moversKey = url.searchParams.get('index_movers');
+    if (moversKey) {
+      const key = moversKey.toUpperCase();
+      if (!INDEX_DEFS[key]) {
+        return new Response(JSON.stringify({ error: `Unknown index ${moversKey}`, known: Object.keys(INDEX_DEFS) }), {
+          status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+      try {
+        const payload = await indexMovers(key, env, url.searchParams.get('refresh') === '1');
+        return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json', ...corsHeaders } });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: String(e.message || e) }), {
+          status: 502, headers: { 'Content-Type': 'application/json', ...corsHeaders },
+        });
+      }
+    }
+
     // ── Quotes endpoint: ?symbols=X,Y,Z ────────────────────────────────────────────────
     const symbolsParam = url.searchParams.get('symbols');
     if (!symbolsParam) {
@@ -461,7 +484,7 @@ export default {
   },
 };
 
-// ── Source selection ────────────────────────────────────────────────────────────────────────
+// ── Source selection ────────────────────────────────────────────────────────────────────────────────────
 // Per symbol, whichever source has the newer quote time wins, with Yahoo
 // keeping anything inside FRESHER_BY_SECONDS so it stays primary while healthy.
 //
@@ -526,7 +549,7 @@ function mergeWithSheet(yahooRows, sheet, symbols, isTodayCph) {
   return merged;
 }
 
-// ── Chart-derived price and today's change ──────────────────────────────────────────────────
+// ── Chart-derived price and today's change ──────────────────────────────────────────────────────────────
 // Yahoo's regularMarketChangePercent goes stale intraday, so the change is
 // rebuilt from the 5-day/5-minute series: walk back to the most recent close
 // that is not today in Copenhagen time and treat that as the previous close.

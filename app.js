@@ -1,4 +1,4 @@
-// ─── App ────────────────────────────────────────────────────────────────
+// ─── App ────────────────────────────────────────────────────────────────────
 function App() {
   const [prices, setPrices]           = useState({});
   const [fx, setFx]                   = useState(CACHED_FX);
@@ -429,6 +429,7 @@ function App() {
       : tickerCtx;
     const backLabel = tickerCtx.origin === 'screener'  ? 'Screener'
                     : tickerCtx.origin === 'watchlist' ? 'Watchlist'
+                    : tickerCtx.origin === 'markets'   ? 'Markets'
                     :                                    'Portfolio';
     return (
       <TickerPage
@@ -535,6 +536,8 @@ function App() {
             )
           ) : view === 'screener' ? (
             <span className="font-semibold text-[15px]">Screener</span>
+          ) : view === 'markets' ? (
+            <span className="font-semibold text-[15px]">Markets</span>
           ) : (
             <span className="font-semibold text-[15px]">Watchlist</span>
           )}
@@ -559,7 +562,7 @@ function App() {
               Sign in
             </button>
           ) : null}
-          {user && view !== 'screener' && (
+          {user && view !== 'screener' && view !== 'markets' && (
           <button
             onClick={handleAddClick}
             title={view === 'watchlist' ? 'Add symbol to watchlist' : 'Add new holding'}
@@ -585,6 +588,7 @@ function App() {
           ['portfolio', 'Holdings'],
           ['watchlist', 'Watchlist'],
           ['screener',  'Screener'],
+          ['markets',   'Markets'],
         ].map(([v, label]) => (
           <button key={v} onClick={() => setView(v)}
             className={`text-[11px] font-semibold px-2.5 py-1 rounded-full transition-colors ${
@@ -644,6 +648,11 @@ function App() {
       {/* ── Screener view ── */}
       {view === 'screener' && (
         <ScreenerView user={user} onRequireLogin={requireLogin} onOpenTicker={openTicker} />
+      )}
+
+      {/* ── Markets view ── */}
+      {view === 'markets' && (
+        <MarketsView holdings={activePositions} onOpenTicker={openTicker} />
       )}
 
       {/* ── Portfolio view ── */}
